@@ -1,0 +1,48 @@
+# cuda_bundle_adjustment.cpp
+
+## 目的
+
+`cuda_bundle_adjustment` は GPU 上の bundle adjustment 計算を提供する module です。同梱コードまたは参照実装の役割を、このリポジトリの文脈で素早く把握できるようにします。
+
+## 対象範囲
+
+- 対象 source: `slam-core/3rd/cuda-bundle-adjustment/src/cuda_bundle_adjustment.cpp`
+- 判定条件: 915 行のため sidecar 文書を維持対象にする
+- 主な定義: `CudaBlockSolver`、`ProfileItem`、`PLIndex`、`CudaBundleAdjustmentImpl`、`get_time_point`、`get_duration`、`ScalarCast`、`IntCast`
+- 主な依存: `cuda_bundle_adjustment.h`、`algorithm`、`unordered_map`、`unordered_set`、`chrono`、`constants.h`
+
+## 現状
+
+### 主な構成
+- `CudaBlockSolver` がこの module の主要な構成要素になっている
+- `ProfileItem` がこの module の主要な構成要素になっている
+- `PLIndex` がこの module の主要な構成要素になっている
+- `CudaBundleAdjustmentImpl` がこの module の主要な構成要素になっている
+- `get_time_point` がこの module の主要な構成要素になっている
+- `get_duration` がこの module の主要な構成要素になっている
+
+### 連携境界
+- `cuda_bundle_adjustment.h` と連携しながら責務を完結させる
+- `algorithm` と連携しながら責務を完結させる
+- `unordered_map` と連携しながら責務を完結させる
+- `unordered_set` と連携しながら責務を完結させる
+- `chrono` と連携しながら責務を完結させる
+- `constants.h` と連携しながら責務を完結させる
+
+## 実装上の判断
+
+- 同梱コードは upstream や参照実装としての責務を尊重し、この文書ではこのリポジトリから見た役割に絞って説明する。
+- project 固有の判断は wrapper や利用側へ寄せ、この file 自体の変更理由を追いやすくする。
+- 長大 file でも source 本体は read-only 前提で扱い、補足説明は sidecar 文書へ追加する。
+
+## 目標
+
+- upstream 更新や参照比較時に、この file を導入している理由と利用位置を短時間で確認できる状態を保つ。
+- project 側の差分が必要になった場合でも、変更理由を wrapper 側文書と合わせて追えるようにする。
+
+## 関連
+
+- `slam-core/3rd/cuda-bundle-adjustment/src/cuda_bundle_adjustment.cpp`
+- `slam-core/3rd/cuda-bundle-adjustment/src/cuda_bundle_adjustment.md`
+- `slam-core/3rd/cuda-bundle-adjustment/src/cuda_linear_solver.md`
+- `slam-core/3rd/cuda-bundle-adjustment/src/sparse_block_matrix.md`
