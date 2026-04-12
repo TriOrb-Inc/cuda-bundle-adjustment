@@ -34,6 +34,7 @@
 - 同梱コードは upstream や参照実装としての責務を尊重し、この文書ではこのリポジトリから見た役割に絞って説明する。
 - project 固有の判断は wrapper や利用側へ寄せ、この file 自体の変更理由を追いやすくする。
 - 長大 file でも source 本体は read-only 前提で扱い、補足説明は sidecar 文書へ追加する。
+- `TRIORB_CUDA_BA_TRACE=1` を付けると、Schur complement、CSR 変換、線形 solver 呼び出し、LM iteration の前後を `stderr` へ出して、Jetson 上の hang 箇所を段階別に追える。
 
 ## 目標
 

@@ -17,9 +17,12 @@ limitations under the License.
 #include "cuda_bundle_adjustment.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <iostream>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
-#include <chrono>
 
 #include "constants.h"
 #include "sparse_block_matrix.h"
@@ -31,6 +34,25 @@ limitations under the License.
 
 namespace cuba
 {
+
+namespace
+{
+
+bool is_cuda_ba_trace_enabled()
+{
+	const char* env_value = std::getenv("TRIORB_CUDA_BA_TRACE");
+	return env_value != nullptr && std::string(env_value) == "1";
+}
+
+void trace_cuda_ba(const std::string& message)
+{
+	if (!is_cuda_ba_trace_enabled())
+		return;
+
+	std::cerr << "[cuda_ba] " << message << std::endl;
+}
+
+} // namespace
 
 static constexpr int EDGE_TYPE_NUM = static_cast<int>(EdgeType::COUNT);
 
@@ -115,9 +137,16 @@ public:
 	void initialize(const VertexMapP& vertexMapP, const VertexMapL& vertexMapL,
 		const EdgeSet2D& edgeSet2D, const EdgeSet3D& edgeSet3D, const RobustKernel kernels[])
 	{
-		const auto t0 = get_time_point();
+		trace_cuda_ba(
+			"solver initialize begin: pose_vertices=" + std::to_string(vertexMapP.size()) +
+			", landmark_vertices=" + std::to_string(vertexMapL.size()) +
+			", edges2d=" + std::to_string(edgeSet2D.size()) +
+			", edges3d=" + std::to_string(edgeSet3D.size()));
+		const auto t0 = std::chrono::steady_clock::now();
+		trace_cuda_ba("solver initialize after start timestamp");
 
 		clear();
+		trace_cuda_ba("solver initialize after clear");
 
 		verticesP_.reserve(vertexMapP.size());
 		verticesL_.reserve(vertexMapL.size());
@@ -245,6 +274,13 @@ public:
 		nedges2D_ = nedges2D;
 		nedges3D_ = nedges3D;
 		nHplBlocks_ = static_cast<int>(HplBlockPos_.size());
+		trace_cuda_ba(
+			"solver initialize host graph prepared: active_poses=" + std::to_string(numP_) +
+			", active_landmarks=" + std::to_string(numL_) +
+			", total_poses=" + std::to_string(verticesP_.size()) +
+			", total_landmarks=" + std::to_string(verticesL_.size()) +
+			", base_edges=" + std::to_string(baseEdges_.size()) +
+			", hpl_blocks=" + std::to_string(nHplBlocks_));
 
 		// set robust kernels
 		for (int i = 0; i < EDGE_TYPE_NUM; i++)
@@ -256,12 +292,19 @@ public:
 
 		profItems_.assign(PROF_ITEM_NUM, 0);
 
-		const auto t1 = get_time_point();
+		const auto t1 = std::chrono::steady_clock::now();
+		trace_cuda_ba("solver initialize end");
 		profItems_[PROF_ITEM_INITIALIZE] += get_duration(t0, t1);
 	}
 
 	void buildStructure()
 	{
+		trace_cuda_ba(
+			"buildStructure begin: poses=" + std::to_string(numP_) +
+			", landmarks=" + std::to_string(numL_) +
+			", edges2d=" + std::to_string(nedges2D_) +
+			", edges3d=" + std::to_string(nedges3D_));
+
 		const auto t0 = get_time_point();
 
 		// allocate device buffers
@@ -357,7 +400,11 @@ public:
 
 		// analyze pattern of Hschur matrix (symbolic decomposition)
 		if (optimizeP_ && optimizeL_)
+		{
+			trace_cuda_ba("buildStructure symbolic initialize begin");
 			linearSolver_->initialize(Hsc_);
+			trace_cuda_ba("buildStructure symbolic initialize end");
+		}
 
 		const auto t2 = get_time_point();
 
@@ -433,6 +480,7 @@ public:
 	{
 		if (optimizeP_ && optimizeL_)
 		{
+			trace_cuda_ba("solve begin: schur complement");
 			const auto t0 = get_time_point();
 
 			////////////////////////////////////////////////////////////////////////////////////
@@ -442,6 +490,7 @@ public:
 			////////////////////////////////////////////////////////////////////////////////////
 			gpu::computeBschure(d_bp_, d_Hpl_, d_Hll_, d_bl_, d_bsc_, d_invHll_, d_Hpl_invHll_);
 			gpu::computeHschure(d_Hpp_, d_Hpl_invHll_, d_Hpl_, d_HscMulBlockIds_, d_Hsc_);
+			trace_cuda_ba("solve schur complement end");
 
 			const auto t1 = get_time_point();
 
@@ -449,8 +498,12 @@ public:
 			// Solve linear equation about Δxp
 			// HSc*Δxp = bp
 			////////////////////////////////////////////////////////////////////////////////////
+			trace_cuda_ba("solve convertHschureBSRToCSR begin");
 			gpu::convertHschureBSRToCSR(d_Hsc_, d_BSR2CSR_, d_HscCSR_);
+			trace_cuda_ba("solve convertHschureBSRToCSR end");
+			trace_cuda_ba("solve linearSolver begin");
 			const bool success = linearSolver_->solve(d_HscCSR_, d_bsc_.values(), d_xp_.values());
+			trace_cuda_ba(std::string("solve linearSolver end: success=") + (success ? "true" : "false"));
 			if (!success)
 				return false;
 
@@ -460,7 +513,9 @@ public:
 			// Solve linear equation about Δxl
 			// Hll*Δxl = -bl - HplT*Δxp
 			////////////////////////////////////////////////////////////////////////////////////
+			trace_cuda_ba("solve schurComplementPost begin");
 			gpu::schurComplementPost(d_invHll_, d_bl_, d_Hpl_, d_xp_, d_xl_);
+			trace_cuda_ba("solve schurComplementPost end");
 
 			const auto t3 = get_time_point();
 			profItems_[PROF_ITEM_SCHUR_COMPLEMENT] += (get_duration(t0, t1) + get_duration(t2, t3));
@@ -802,32 +857,51 @@ public:
 		// Levenberg-Marquardt iteration
 		for (int iteration = 0; iteration < niterations; iteration++)
 		{
+			trace_cuda_ba("optimize iteration begin: iteration=" + std::to_string(iteration));
 			if (iteration == 0)
 				solver_.buildStructure();
 
 			const double iniF = solver_.computeErrors();
 			F = iniF;
+			trace_cuda_ba("optimize computeErrors end: iteration=" + std::to_string(iteration) +
+				", initial_error=" + std::to_string(iniF));
 
 			solver_.buildSystem();
+			trace_cuda_ba("optimize buildSystem end: iteration=" + std::to_string(iteration));
 			
 			if (iteration == 0)
 				lambda = tau * solver_.maxDiagonal();
+			trace_cuda_ba("optimize lambda prepared: iteration=" + std::to_string(iteration) +
+				", lambda=" + std::to_string(lambda));
 
 			int q = 0;
 			double rho = -1;
 			for (; q < maxq && rho < 0; q++)
 			{
+				trace_cuda_ba("optimize LM attempt begin: iteration=" + std::to_string(iteration) +
+					", attempt=" + std::to_string(q) +
+					", lambda=" + std::to_string(lambda));
 				solver_.push();
 
 				solver_.setLambda(lambda);
 
 				const bool success = solver_.solve();
+				trace_cuda_ba(std::string("optimize solver end: iteration=") + std::to_string(iteration) +
+					", attempt=" + std::to_string(q) +
+					", success=" + (success ? "true" : "false"));
 
 				solver_.update();
+				trace_cuda_ba("optimize update end: iteration=" + std::to_string(iteration) +
+					", attempt=" + std::to_string(q));
 
 				const double Fhat = solver_.computeErrors();
 				const double scale = solver_.computeScale(lambda) + 1e-3;
 				rho = success ? (F - Fhat) / scale : -1;
+				trace_cuda_ba("optimize rho evaluated: iteration=" + std::to_string(iteration) +
+					", attempt=" + std::to_string(q) +
+					", Fhat=" + std::to_string(Fhat) +
+					", scale=" + std::to_string(scale) +
+					", rho=" + std::to_string(rho));
 
 				if (rho > 0)
 				{
