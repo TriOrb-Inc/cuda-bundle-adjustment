@@ -53,6 +53,11 @@ constexpr int BLOCK_ACTIVE_ERRORS = 512;
 constexpr int BLOCK_MAX_DIAGONAL = 512;
 constexpr int BLOCK_COMPUTE_SCALE = 512;
 
+inline void prepareCudaThreadContext()
+{
+	CUDA_CHECK(cudaSetDevice(0));
+}
+
 ////////////////////////////////////////////////////////////////////////////////////
 // Type definitions
 ////////////////////////////////////////////////////////////////////////////////////
@@ -1145,11 +1150,13 @@ __global__ void solveDiagonalSystemKernel(int size, PxPBlockPtr Hpp, Px1BlockPtr
 
 void waitForKernelCompletion()
 {
+	prepareCudaThreadContext();
 	CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 void exclusiveScan(const int* src, int* dst, int size)
 {
+	prepareCudaThreadContext();
 	auto ptrSrc = thrust::device_pointer_cast(src);
 	auto ptrDst = thrust::device_pointer_cast(dst);
 	thrust::exclusive_scan(ptrSrc, ptrSrc + size, ptrDst);
@@ -1157,6 +1164,7 @@ void exclusiveScan(const int* src, int* dst, int size)
 
 void buildHplStructure(GpuVec3i& blockpos, GpuHplBlockMat& Hpl, GpuVec1i& indexPL, GpuVec1i& nnzPerCol)
 {
+	prepareCudaThreadContext();
 	const int nblocks = Hpl.nnz();
 	const int block = 1024;
 	const int grid = divUp(nblocks, block);
@@ -1175,6 +1183,7 @@ void buildHplStructure(GpuVec3i& blockpos, GpuHplBlockMat& Hpl, GpuVec1i& indexP
 void findHschureMulBlockIndices(const GpuHplBlockMat& Hpl, const GpuHscBlockMat& Hsc,
 	GpuVec3i& mulBlockIds)
 {
+	prepareCudaThreadContext();
 	const int block = 1024;
 	const int grid = divUp(Hpl.cols(), block);
 
@@ -1194,6 +1203,7 @@ Scalar computeActiveErrors_(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec
 	const GpuVecAny& _measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL, Scalar robustDelta,
 	const GpuVecAny& _errors, GpuVec3d& Xcs, Scalar* chi)
 {
+	prepareCudaThreadContext();
 	const auto& measurements = _measurements.getCRef<Vecxd<MDIM>>();
 	auto& errors = _errors.getRef<Vecxd<MDIM>>();
 	const RobustKernelFunc<RK_TYPE> robustKernel(robustDelta);
@@ -1299,6 +1309,7 @@ template <int MDIM>
 void computeChiSquares_(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5d& cameras, const GpuVec3d& Xws,
 	const GpuVecAny& _measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL, GpuVec1d& chiSqs)
 {
+	prepareCudaThreadContext();
 	using Vecmd = Vecxd<MDIM>;
 
 	const GpuVec<Vecmd>& measurements = _measurements.getCRef<Vecmd>();
@@ -1408,6 +1419,7 @@ void restoreDiagonal(GpuLxLBlockVec& Hll, const GpuLx1BlockVec& backup)
 void computeBschure(const GpuPx1BlockVec& bp, const GpuHplBlockMat& Hpl, const GpuLxLBlockVec& Hll,
 	const GpuLx1BlockVec& bl, GpuPx1BlockVec& bsc, GpuLxLBlockVec& invHll, GpuPxLBlockVec& Hpl_invHll)
 {
+	prepareCudaThreadContext();
 	const int cols = Hll.size();
 	const int block = 256;
 	const int grid = divUp(cols, block);
@@ -1421,6 +1433,7 @@ void computeBschure(const GpuPx1BlockVec& bp, const GpuHplBlockMat& Hpl, const G
 void computeHschure(const GpuPxPBlockVec& Hpp, const GpuPxLBlockVec& Hpl_invHll,
 	const GpuHplBlockMat& Hpl, const GpuVec3i& mulBlockIds, GpuHscBlockMat& Hsc)
 {
+	prepareCudaThreadContext();
 	const int nmulBlocks = mulBlockIds.ssize();
 	const int block = 256;
 	const int grid1 = divUp(Hsc.rows(), block);
@@ -1454,6 +1467,7 @@ void twistCSR(int size, int nnz, const int* srcRowPtr, const int* srcColInd, con
 
 void permute(int size, const Scalar* src, Scalar* dst, const int* P)
 {
+	prepareCudaThreadContext();
 	auto ptrSrc = thrust::device_pointer_cast(src);
 	auto ptrDst = thrust::device_pointer_cast(dst);
 	auto ptrMap = thrust::device_pointer_cast(P);
@@ -1463,6 +1477,7 @@ void permute(int size, const Scalar* src, Scalar* dst, const int* P)
 void schurComplementPost(const GpuLxLBlockVec& invHll, const GpuLx1BlockVec& bl,
 	const GpuHplBlockMat& Hpl, const GpuPx1BlockVec& xp, GpuLx1BlockVec& xl)
 {
+	prepareCudaThreadContext();
 	const int block = 1024;
 	const int grid = divUp(Hpl.cols(), block);
 
@@ -1495,6 +1510,7 @@ void updateLandmarks(const GpuLx1BlockVec& xl, GpuVec3d& Xws)
 
 void computeScale(const GpuVec1d& x, const GpuVec1d& b, Scalar* scale, Scalar lambda)
 {
+	prepareCudaThreadContext();
 	const int block = BLOCK_COMPUTE_SCALE;
 	const int grid = 4;
 
