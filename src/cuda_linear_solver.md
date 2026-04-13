@@ -34,6 +34,11 @@
 - 同梱コードは upstream や参照実装としての責務を尊重し、この文書ではこのリポジトリから見た役割に絞って説明する。
 - project 固有の判断は wrapper や利用側へ寄せ、この file 自体の変更理由を追いやすくする。
 - 長大 file でも source 本体は read-only 前提で扱い、補足説明は sidecar 文書へ追加する。
+- `TRIORB_CUDA_BA_ORDERING` で `metis` / `symrcm` / `symamd` / `symmdq` / `none` を切り替えられる。
+- Jetson では `cusolverSpXcsrmetisndHost` が固まる run を避けるため、既定を `none` にして unordered factorization を優先する。
+- `TRIORB_CUDA_BA_TRACE=1` を付けると、ordering 選択、symbolic analyze、factorize、solve の前後を `stderr` へ出して、CUDA solver の停止位置を切り分けられる。
+- `TRIORB_CUDA_BA_LINEAR_SOLVER=auto|sparse|dense` で CUDA 線形 solver backend を切り替えられる。`auto` では既定で sparse Cholesky を使い、Jetson Orin なのに `BOARD=t186ref` を返す host のように `cusparseCreate()` が固まる環境だけ dense Cholesky へ自動退避する。
+- dense backend は `Hschur` の CSR 値を host で dense 対称行列へ展開し、`cusolverDn{S,D}potrf/potrs` で GPU solve を続行する。`.79` のように `cusparse` だけ壊れて `cusolverDn` は使える host で full BA を止めないための退避経路である。
 
 ## 目標
 
