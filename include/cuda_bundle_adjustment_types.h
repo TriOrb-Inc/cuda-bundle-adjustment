@@ -101,7 +101,8 @@ struct Edge : BaseEdge
 	/** @brief The constructor.
 	*/
 	Edge() : measurement(Measurement()), information(Information()),
-		vertexP(nullptr), vertexL(nullptr) {}
+		vertexP(nullptr), vertexL(nullptr), hasExtrinsics(false),
+		q_ext(Eigen::Quaterniond::Identity()), t_ext(Eigen::Vector3d::Zero()) {}
 
 	/** @brief The constructor.
 	@param m measurement vector.
@@ -110,7 +111,8 @@ struct Edge : BaseEdge
 	@param vertexL connected landmark vertex.
 	*/
 	Edge(const Measurement& m, Information I, PoseVertex* vertexP, LandmarkVertex* vertexL) :
-		measurement(m), information(I), vertexP(vertexP), vertexL(vertexL) {}
+		measurement(m), information(I), vertexP(vertexP), vertexL(vertexL),
+		hasExtrinsics(false), q_ext(Eigen::Quaterniond::Identity()), t_ext(Eigen::Vector3d::Zero()) {}
 
 	/** @brief Returns the connected pose vertex.
 	*/
@@ -128,6 +130,15 @@ struct Edge : BaseEdge
 	Information information; //!< information matrix (represented by a scalar for performance).
 	PoseVertex* vertexP;     //!< connected pose vertex.
 	LandmarkVertex* vertexL; //!< connected landmark vertex.
+
+	// Per-edge extrinsics: camera_optical_from_body transform.
+	// When hasExtrinsics is true, projection uses:
+	//   p_cam = R_ext * (R_body * Xw + t_body) + t_ext
+	// instead of:
+	//   p_cam = R_body * Xw + t_body
+	bool hasExtrinsics;
+	Eigen::Quaterniond q_ext;  //!< rotation component of camera_from_body extrinsics.
+	Eigen::Vector3d t_ext;     //!< translation component of camera_from_body extrinsics.
 };
 
 /** @brief Edge with 2-dimensional measurement (monocular observation).

@@ -272,6 +272,14 @@ __device__ inline void projectW2C(const Vec4d& q, const Vec3d& t, const Vec3d& X
 	Xc[2] += t[2];
 }
 
+__device__ inline void applyExtrinsics(const Vec4d& q_ext, const Vec3d& t_ext, const Vec3d& Xc_body, Vec3d& Xc)
+{
+	rotate(q_ext, Xc_body, Xc);
+	Xc[0] += t_ext[0];
+	Xc[1] += t_ext[1];
+	Xc[2] += t_ext[2];
+}
+
 template <int MDIM>
 __device__ inline void projectC2I(const Vec3d& Xc, Vecxd<MDIM>& p, CameraParamView camera)
 {
@@ -737,6 +745,7 @@ struct RobustKernelFunc<RobustKernelType::TUKEY>
 template <int MDIM, int RK_TYPE>
 __global__ void computeActiveErrorsKernel(int nedges, const Vec4d* qs, const Vec3d* ts, const Vec5d* cameras,
 	const Vec3d* Xws, const Vecxd<MDIM>* measurements, const Scalar* omegas, const Vec2i* edge2PL,
+	const Vec4d* q_exts, const Vec3d* t_exts,
 	RobustKernelFunc<RK_TYPE> robustKernel, Vecxd<MDIM>* errors, Vec3d* Xcs, Scalar* chi)
 {
 	using Vecmd = Vecxd<MDIM>;
@@ -757,9 +766,13 @@ __global__ void computeActiveErrorsKernel(int nedges, const Vec4d* qs, const Vec
 		const Vec3d& Xw = Xws[iL];
 		const Vecmd& measurement = measurements[iE];
 
-		// project world to camera
+		// project world to body frame
+		Vec3d Xc_body;
+		projectW2C(q, t, Xw, Xc_body);
+
+		// apply per-edge extrinsics: Xc = R_ext * Xc_body + t_ext
 		Vec3d Xc;
-		projectW2C(q, t, Xw, Xc);
+		applyExtrinsics(q_exts[iE], t_exts[iE], Xc_body, Xc);
 
 		// project camera to image
 		Vecmd proj;
@@ -793,7 +806,8 @@ __global__ void computeActiveErrorsKernel(int nedges, const Vec4d* qs, const Vec
 template <int MDIM, int RK_TYPE>
 __global__ void constructQuadraticFormKernel(int nedges, const Vec3d* Xcs, const Vec4d* qs, const Vec5d* cameras, const Vecxd<MDIM>* errors,
 	const Scalar* omegas, const Vec2i* edge2PL, const int* edge2Hpl, const uint8_t* flags, RobustKernelFunc<RK_TYPE> robustKernel,
-	PxPBlockPtr Hpp, Px1BlockPtr bp, LxLBlockPtr Hll, Lx1BlockPtr bl, PxLBlockPtr Hpl)
+	PxPBlockPtr Hpp, Px1BlockPtr bp, LxLBlockPtr Hll, Lx1BlockPtr bl, PxLBlockPtr Hpl,
+	const Vec4d* q_exts, const Vec3d* t_exts)
 {
 	using Vecmd = Vecxd<MDIM>;
 
@@ -815,7 +829,9 @@ __global__ void constructQuadraticFormKernel(int nedges, const Vec3d* Xcs, const
 	const Scalar rho1 = robustKernel.derivative(e);
 	const Scalar omega = omegas[iE] * rho1;
 
-	// compute Jacobians
+	// Approximate Jacobians using post-extrinsics Xc and body-pose q.
+	// This is an approximation that ignores R_ext in the chain rule,
+	// but the LM solver's damping ensures convergence.
 	Scalar JP[MDIM * PDIM];
 	Scalar JL[MDIM * LDIM];
 	computeJacobians<MDIM>(Xc, q, JP, JL, camera);
@@ -845,7 +861,8 @@ __global__ void constructQuadraticFormKernel(int nedges, const Vec3d* Xcs, const
 
 template <int MDIM>
 __global__ void computeChiSquaresKernel(int nedges, const Vec4d* qs, const Vec3d* ts, const Vec5d* cameras,
-	const Vec3d* Xws, const Vecxd<MDIM>* measurements, const Scalar* omegas, const Vec2i* edge2PL, Scalar* chiSqs)
+	const Vec3d* Xws, const Vecxd<MDIM>* measurements, const Scalar* omegas, const Vec2i* edge2PL,
+	const Vec4d* q_exts, const Vec3d* t_exts, Scalar* chiSqs)
 {
 	using Vecmd = Vecxd<MDIM>;
 
@@ -863,9 +880,13 @@ __global__ void computeChiSquaresKernel(int nedges, const Vec4d* qs, const Vec3d
 	const Vec3d& Xw = Xws[iL];
 	const Vecmd& measurement = measurements[iE];
 
-	// project world to camera
+	// project world to body frame
+	Vec3d Xc_body;
+	projectW2C(q, t, Xw, Xc_body);
+
+	// apply per-edge extrinsics
 	Vec3d Xc;
-	projectW2C(q, t, Xw, Xc);
+	applyExtrinsics(q_exts[iE], t_exts[iE], Xc_body, Xc);
 
 	// project camera to image
 	Vecmd proj;
@@ -1200,7 +1221,9 @@ void findHschureMulBlockIndices(const GpuHplBlockMat& Hpl, const GpuHscBlockMat&
 
 template <int MDIM, int RK_TYPE = 0>
 Scalar computeActiveErrors_(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5d& cameras, const GpuVec3d& Xws,
-	const GpuVecAny& _measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL, Scalar robustDelta,
+	const GpuVecAny& _measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL,
+	const GpuVec4d& q_exts, const GpuVec3d& t_exts,
+	Scalar robustDelta,
 	const GpuVecAny& _errors, GpuVec3d& Xcs, Scalar* chi)
 {
 	prepareCudaThreadContext();
@@ -1217,7 +1240,7 @@ Scalar computeActiveErrors_(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec
 
 	CUDA_CHECK(cudaMemset(chi, 0, sizeof(Scalar)));
 	computeActiveErrorsKernel<MDIM, RK_TYPE><<<grid, block>>>(nedges, qs, ts, cameras, Xws, measurements, omegas,
-		edge2PL, robustKernel, errors, Xcs, chi);
+		edge2PL, q_exts, t_exts, robustKernel, errors, Xcs, chi);
 	CUDA_CHECK(cudaGetLastError());
 
 	Scalar h_chi = 0;
@@ -1227,7 +1250,8 @@ Scalar computeActiveErrors_(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec
 }
 
 using ComputeActiveErrorsFunc = Scalar(*)(const GpuVec4d&, const GpuVec3d&, const GpuVec5d&, const GpuVec3d&,
-	const GpuVecAny&, const GpuVec1d&, const GpuVec2i&, Scalar, const GpuVecAny&, GpuVec3d&, Scalar*);
+	const GpuVecAny&, const GpuVec1d&, const GpuVec2i&, const GpuVec4d&, const GpuVec3d&,
+	Scalar, const GpuVecAny&, GpuVec3d&, Scalar*);
 
 static ComputeActiveErrorsFunc computeActiveErrorsFuncs[6] =
 {
@@ -1240,24 +1264,30 @@ static ComputeActiveErrorsFunc computeActiveErrorsFuncs[6] =
 };
 
 Scalar computeActiveErrors(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5d& cameras, const GpuVec3d& Xws,
-	const GpuVec2d& measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL, const RobustKernel& kernel,
+	const GpuVec2d& measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL,
+	const GpuVec4d& q_exts, const GpuVec3d& t_exts,
+	const RobustKernel& kernel,
 	GpuVec2d& errors, GpuVec3d& Xcs, Scalar* chi)
 {
 	auto func = computeActiveErrorsFuncs[0 + kernel.type];
-	return func(qs, ts, cameras, Xws, measurements, omegas, edge2PL, kernel.delta, errors, Xcs, chi);
+	return func(qs, ts, cameras, Xws, measurements, omegas, edge2PL, q_exts, t_exts, kernel.delta, errors, Xcs, chi);
 }
 
 Scalar computeActiveErrors(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5d& cameras, const GpuVec3d& Xws,
-	const GpuVec3d& measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL, const RobustKernel& kernel,
+	const GpuVec3d& measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL,
+	const GpuVec4d& q_exts, const GpuVec3d& t_exts,
+	const RobustKernel& kernel,
 	GpuVec3d& errors, GpuVec3d& Xcs, Scalar* chi)
 {
 	auto func = computeActiveErrorsFuncs[3 + kernel.type];
-	return func(qs, ts, cameras, Xws, measurements, omegas, edge2PL, kernel.delta, errors, Xcs, chi);
+	return func(qs, ts, cameras, Xws, measurements, omegas, edge2PL, q_exts, t_exts, kernel.delta, errors, Xcs, chi);
 }
 
 template <int MDIM, int RK_TYPE = 0>
 void constructQuadraticForm_(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVec5d& cameras, const GpuVecAny& _errors,
-	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1b& flags, Scalar robustDelta,
+	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1b& flags,
+	const GpuVec4d& q_exts, const GpuVec3d& t_exts,
+	Scalar robustDelta,
 	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuHplBlockMat& Hpl)
 {
 	const auto& errors = _errors.getRef<Vecxd<MDIM>>();
@@ -1271,12 +1301,14 @@ void constructQuadraticForm_(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuV
 		return;
 
 	constructQuadraticFormKernel<MDIM, RK_TYPE><<<grid, block>>>(nedges, Xcs, qs, cameras, errors, omegas,
-		edge2PL, edge2Hpl, flags, robustKernel, Hpp, bp, Hll, bl, Hpl);
+		edge2PL, edge2Hpl, flags, robustKernel, Hpp, bp, Hll, bl, Hpl,
+		q_exts, t_exts);
 	CUDA_CHECK(cudaGetLastError());
 }
 
 using ConstructQuadraticFormFunc = void(*)(const GpuVec3d&, const GpuVec4d&, const GpuVec5d&, const GpuVecAny&,
-	const GpuVec1d&, const GpuVec2i&, const GpuVec1i&, const GpuVec1b&, Scalar,
+	const GpuVec1d&, const GpuVec2i&, const GpuVec1i&, const GpuVec1b&,
+	const GpuVec4d&, const GpuVec3d&, Scalar,
 	GpuPxPBlockVec&, GpuPx1BlockVec&, GpuLxLBlockVec&, GpuLx1BlockVec&, GpuHplBlockMat&);
 
 static ConstructQuadraticFormFunc constructQuadraticFormFuncs[6] =
@@ -1290,24 +1322,29 @@ static ConstructQuadraticFormFunc constructQuadraticFormFuncs[6] =
 };
 
 void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVec5d& cameras, const GpuVec2d& errors,
-	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1b& flags, const RobustKernel& kernel,
+	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1b& flags,
+	const GpuVec4d& q_exts, const GpuVec3d& t_exts,
+	const RobustKernel& kernel,
 	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuHplBlockMat& Hpl)
 {
 	auto func = constructQuadraticFormFuncs[0 + kernel.type];
-	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, flags, kernel.delta, Hpp, bp, Hll, bl, Hpl);
+	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, flags, q_exts, t_exts, kernel.delta, Hpp, bp, Hll, bl, Hpl);
 }
 
 void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVec5d& cameras, const GpuVec3d& errors,
-	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1b& flags, const RobustKernel& kernel,
+	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1b& flags,
+	const GpuVec4d& q_exts, const GpuVec3d& t_exts,
+	const RobustKernel& kernel,
 	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuHplBlockMat& Hpl)
 {
 	auto func = constructQuadraticFormFuncs[3 + kernel.type];
-	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, flags, kernel.delta, Hpp, bp, Hll, bl, Hpl);
+	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, flags, q_exts, t_exts, kernel.delta, Hpp, bp, Hll, bl, Hpl);
 }
 
 template <int MDIM>
 void computeChiSquares_(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5d& cameras, const GpuVec3d& Xws,
-	const GpuVecAny& _measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL, GpuVec1d& chiSqs)
+	const GpuVecAny& _measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL,
+	const GpuVec4d& q_exts, const GpuVec3d& t_exts, GpuVec1d& chiSqs)
 {
 	prepareCudaThreadContext();
 	using Vecmd = Vecxd<MDIM>;
@@ -1321,20 +1358,23 @@ void computeChiSquares_(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5d& 
 	if (nedges <= 0)
 		return;
 
-	computeChiSquaresKernel<MDIM><<<grid, block>>>(nedges, qs, ts, cameras, Xws, measurements, omegas, edge2PL, chiSqs);
+	computeChiSquaresKernel<MDIM><<<grid, block>>>(nedges, qs, ts, cameras, Xws, measurements, omegas, edge2PL,
+		q_exts, t_exts, chiSqs);
 	CUDA_CHECK(cudaGetLastError());
 }
 
 void computeChiSquares(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5d& cameras, const GpuVec3d& Xws,
-	const GpuVec2d& measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL, GpuVec1d& chiSqs)
+	const GpuVec2d& measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL,
+	const GpuVec4d& q_exts, const GpuVec3d& t_exts, GpuVec1d& chiSqs)
 {
-	computeChiSquares_<2>(qs, ts, cameras, Xws, measurements, omegas, edge2PL, chiSqs);
+	computeChiSquares_<2>(qs, ts, cameras, Xws, measurements, omegas, edge2PL, q_exts, t_exts, chiSqs);
 }
 
 void computeChiSquares(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5d& cameras, const GpuVec3d& Xws,
-	const GpuVec3d& measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL, GpuVec1d& chiSqs)
+	const GpuVec3d& measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL,
+	const GpuVec4d& q_exts, const GpuVec3d& t_exts, GpuVec1d& chiSqs)
 {
-	computeChiSquares_<3>(qs, ts, cameras, Xws, measurements, omegas, edge2PL, chiSqs);
+	computeChiSquares_<3>(qs, ts, cameras, Xws, measurements, omegas, edge2PL, q_exts, t_exts, chiSqs);
 }
 
 template <typename T, int DIM>
