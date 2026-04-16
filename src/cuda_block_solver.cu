@@ -333,53 +333,82 @@ __device__ inline void quaternionToRotationMatrix(const Vec4d& q, MatView3x3d R)
 	R(2, 2) = 1 - (txx + tyy);
 }
 
+// Exact Jacobians accounting for per-edge extrinsics R_ext in the chain rule.
+// Xc: camera-optical-frame point (post-extrinsics).
+// Xc_body: body-frame point (pre-extrinsics).
+// q: body pose quaternion.
+// q_ext/t_ext: camera_optical_from_body extrinsics.
 template <int MDIM>
-__device__ void computeJacobians(const Vec3d& Xc, const Vec4d& q,
+__device__ void computeJacobiansExact(const Vec3d& Xc, const Vec3d& Xc_body, const Vec4d& q,
+	const Vec4d& q_ext, const Vec3d& t_ext,
 	MatView<Scalar, MDIM, PDIM> JP, MatView<Scalar, MDIM, LDIM> JL, CameraParamView camera)
 {
 }
 
 template <>
-__device__ void computeJacobians<2>(const Vec3d& Xc, const Vec4d& q, MatView2x6d JP, MatView2x3d JL, CameraParamView camera)
+__device__ void computeJacobiansExact<2>(const Vec3d& Xc, const Vec3d& Xc_body, const Vec4d& q,
+	const Vec4d& q_ext, const Vec3d& t_ext,
+	MatView2x6d JP, MatView2x3d JL, CameraParamView camera)
 {
 	const Scalar X = Xc[0];
 	const Scalar Y = Xc[1];
 	const Scalar Z = Xc[2];
 	const Scalar invZ = 1 / Z;
-	const Scalar x = invZ * X;
-	const Scalar y = invZ * Y;
 	const Scalar fu = camera.fx();
 	const Scalar fv = camera.fy();
-	const Scalar fu_invZ = fu * invZ;
-	const Scalar fv_invZ = fv * invZ;
 
-	Matx<Scalar, 3, 3> R;
-	quaternionToRotationMatrix(q, R);
+	// J_pi: 2×3 projection Jacobian d(proj)/d(Xc)
+	// row 0: [-fu/Z,    0, fu*X/Z^2]
+	// row 1: [   0, -fv/Z, fv*Y/Z^2]
+	const Scalar invZZ = invZ * invZ;
+	Scalar Jpi[2][3];
+	Jpi[0][0] = -fu * invZ;  Jpi[0][1] = 0;            Jpi[0][2] = fu * X * invZZ;
+	Jpi[1][0] = 0;           Jpi[1][1] = -fv * invZ;    Jpi[1][2] = fv * Y * invZZ;
 
-	JL(0, 0) = -fu_invZ * (R(0, 0) - x * R(2, 0));
-	JL(0, 1) = -fu_invZ * (R(0, 1) - x * R(2, 1));
-	JL(0, 2) = -fu_invZ * (R(0, 2) - x * R(2, 2));
-	JL(1, 0) = -fv_invZ * (R(1, 0) - y * R(2, 0));
-	JL(1, 1) = -fv_invZ * (R(1, 1) - y * R(2, 1));
-	JL(1, 2) = -fv_invZ * (R(1, 2) - y * R(2, 2));
+	// R_ext: extrinsics rotation matrix
+	Matx<Scalar, 3, 3> Re;
+	quaternionToRotationMatrix(q_ext, Re);
 
-	JP(0, 0) = +fu * x * y;
-	JP(0, 1) = -fu * (1 + x * x);
-	JP(0, 2) = +fu * y;
-	JP(0, 3) = -fu_invZ;
-	JP(0, 4) = 0;
-	JP(0, 5) = +fu_invZ * x;
+	// J_pi_ext = J_pi * R_ext  (2×3)
+	Scalar Jpe[2][3];
+	for (int r = 0; r < 2; r++)
+		for (int c = 0; c < 3; c++)
+			Jpe[r][c] = Jpi[r][0] * Re(0, c) + Jpi[r][1] * Re(1, c) + Jpi[r][2] * Re(2, c);
 
-	JP(1, 0) = +fv * (1 + y * y);
-	JP(1, 1) = -fv * x * y;
-	JP(1, 2) = -fv * x;
-	JP(1, 3) = 0;
-	JP(1, 4) = -fv_invZ;
-	JP(1, 5) = +fv_invZ * y;
+	// R_body
+	Matx<Scalar, 3, 3> Rb;
+	quaternionToRotationMatrix(q, Rb);
+
+	// JL = J_pi_ext * R_body  (2×3)
+	for (int r = 0; r < 2; r++)
+		for (int c = 0; c < 3; c++)
+			JL(r, c) = Jpe[r][0] * Rb(0, c) + Jpe[r][1] * Rb(1, c) + Jpe[r][2] * Rb(2, c);
+
+	// JP rotation columns [0:3]: J_pi_ext * [-Xc_body×]
+	// [-Xc_body×] = [[0, Zb, -Yb], [-Zb, 0, Xb], [Yb, -Xb, 0]]
+	const Scalar Xb = Xc_body[0];
+	const Scalar Yb = Xc_body[1];
+	const Scalar Zb = Xc_body[2];
+	JP(0, 0) = Jpe[0][1] * (-Zb) + Jpe[0][2] * Yb;
+	JP(0, 1) = Jpe[0][0] * Zb + Jpe[0][2] * (-Xb);
+	JP(0, 2) = Jpe[0][0] * (-Yb) + Jpe[0][1] * Xb;
+	JP(1, 0) = Jpe[1][1] * (-Zb) + Jpe[1][2] * Yb;
+	JP(1, 1) = Jpe[1][0] * Zb + Jpe[1][2] * (-Xb);
+	JP(1, 2) = Jpe[1][0] * (-Yb) + Jpe[1][1] * Xb;
+
+	// JP translation columns [3:6]: J_pi_ext
+	JP(0, 3) = Jpe[0][0];
+	JP(0, 4) = Jpe[0][1];
+	JP(0, 5) = Jpe[0][2];
+	JP(1, 3) = Jpe[1][0];
+	JP(1, 4) = Jpe[1][1];
+	JP(1, 5) = Jpe[1][2];
 }
 
 template <>
-__device__ void computeJacobians<3>(const Vec3d& Xc, const Vec4d& q, MatView3x6d JP, MatView3x3d JL, CameraParamView camera)
+__device__ void computeJacobiansExact<3>(const Vec3d& Xc, const Vec3d& Xc_body, const Vec4d& q,
+	const Vec4d& q_ext, const Vec3d& t_ext,
+	MatView3x6d JP, MatView3x3d JL, CameraParamView camera)
 {
 	const Scalar X = Xc[0];
 	const Scalar Y = Xc[1];
@@ -390,41 +419,52 @@ __device__ void computeJacobians<3>(const Vec3d& Xc, const Vec4d& q, MatView3x6d
 	const Scalar fv = camera.fy();
 	const Scalar bf = camera.bf();
 
-	Matx<Scalar, 3, 3> R;
-	quaternionToRotationMatrix(q, R);
+	// J_pi: 3×3 projection Jacobian for stereo
+	// row 0 (left u):  [-fu/Z,    0, fu*X/Z^2]
+	// row 1 (left v):  [   0, -fv/Z, fv*Y/Z^2]
+	// row 2 (right u): [-fu/Z,    0, (fu*X+bf)/Z^2]
+	Scalar Jpi[3][3];
+	Jpi[0][0] = -fu * invZ;  Jpi[0][1] = 0;            Jpi[0][2] = fu * X * invZZ;
+	Jpi[1][0] = 0;           Jpi[1][1] = -fv * invZ;    Jpi[1][2] = fv * Y * invZZ;
+	Jpi[2][0] = -fu * invZ;  Jpi[2][1] = 0;            Jpi[2][2] = (fu * X + bf) * invZZ;
 
-	JL(0, 0) = -fu * R(0, 0) * invZ + fu * X * R(2, 0) * invZZ;
-	JL(0, 1) = -fu * R(0, 1) * invZ + fu * X * R(2, 1) * invZZ;
-	JL(0, 2) = -fu * R(0, 2) * invZ + fu * X * R(2, 2) * invZZ;
+	// R_ext
+	Matx<Scalar, 3, 3> Re;
+	quaternionToRotationMatrix(q_ext, Re);
 
-	JL(1, 0) = -fv * R(1, 0) * invZ + fv * Y * R(2, 0) * invZZ;
-	JL(1, 1) = -fv * R(1, 1) * invZ + fv * Y * R(2, 1) * invZZ;
-	JL(1, 2) = -fv * R(1, 2) * invZ + fv * Y * R(2, 2) * invZZ;
+	// J_pi_ext = J_pi * R_ext  (3×3)
+	Scalar Jpe[3][3];
+	for (int r = 0; r < 3; r++)
+		for (int c = 0; c < 3; c++)
+			Jpe[r][c] = Jpi[r][0] * Re(0, c) + Jpi[r][1] * Re(1, c) + Jpi[r][2] * Re(2, c);
 
-	JL(2, 0) = JL(0, 0) - bf * R(2, 0) * invZZ;
-	JL(2, 1) = JL(0, 1) - bf * R(2, 1) * invZZ;
-	JL(2, 2) = JL(0, 2) - bf * R(2, 2) * invZZ;
+	// R_body
+	Matx<Scalar, 3, 3> Rb;
+	quaternionToRotationMatrix(q, Rb);
 
-	JP(0, 0) = X * Y * invZZ * fu;
-	JP(0, 1) = -(1 + (X * X * invZZ)) * fu;
-	JP(0, 2) = Y * invZ * fu;
-	JP(0, 3) = -1 * invZ * fu;
-	JP(0, 4) = 0;
-	JP(0, 5) = X * invZZ * fu;
+	// JL = J_pi_ext * R_body  (3×3)
+	for (int r = 0; r < 3; r++)
+		for (int c = 0; c < 3; c++)
+			JL(r, c) = Jpe[r][0] * Rb(0, c) + Jpe[r][1] * Rb(1, c) + Jpe[r][2] * Rb(2, c);
 
-	JP(1, 0) = (1 + Y * Y * invZZ) * fv;
-	JP(1, 1) = -X * Y * invZZ * fv;
-	JP(1, 2) = -X * invZ * fv;
-	JP(1, 3) = 0;
-	JP(1, 4) = -1 * invZ * fv;
-	JP(1, 5) = Y * invZZ * fv;
+	// JP rotation columns [0:3]: J_pi_ext * [-Xc_body×]
+	const Scalar Xb = Xc_body[0];
+	const Scalar Yb = Xc_body[1];
+	const Scalar Zb = Xc_body[2];
+	for (int r = 0; r < 3; r++)
+	{
+		JP(r, 0) = Jpe[r][1] * (-Zb) + Jpe[r][2] * Yb;
+		JP(r, 1) = Jpe[r][0] * Zb + Jpe[r][2] * (-Xb);
+		JP(r, 2) = Jpe[r][0] * (-Yb) + Jpe[r][1] * Xb;
+	}
 
-	JP(2, 0) = JP(0, 0) - bf * Y * invZZ;
-	JP(2, 1) = JP(0, 1) + bf * X * invZZ;
-	JP(2, 2) = JP(0, 2);
-	JP(2, 3) = JP(0, 3);
-	JP(2, 4) = 0;
-	JP(2, 5) = JP(0, 5) - bf * invZZ;
+	// JP translation columns [3:6]: J_pi_ext
+	for (int r = 0; r < 3; r++)
+	{
+		JP(r, 3) = Jpe[r][0];
+		JP(r, 4) = Jpe[r][1];
+		JP(r, 5) = Jpe[r][2];
+	}
 }
 
 __device__ inline void Sym3x3Inv(ConstMatView3x3d A, MatView3x3d B)
@@ -829,12 +869,26 @@ __global__ void constructQuadraticFormKernel(int nedges, const Vec3d* Xcs, const
 	const Scalar rho1 = robustKernel.derivative(e);
 	const Scalar omega = omegas[iE] * rho1;
 
-	// Approximate Jacobians using post-extrinsics Xc and body-pose q.
-	// This is an approximation that ignores R_ext in the chain rule,
-	// but the LM solver's damping ensures convergence.
+	// Exact Jacobians: per-edge extrinsics を反映した正確な Jacobian。
+	// Xc_body を Xc と extrinsics の逆変換で復元する。
+	// Xc = R_ext * Xc_body + t_ext → Xc_body = R_ext^T * (Xc - t_ext)
+	const Vec4d& q_ext = q_exts[iE];
+	const Vec3d& t_ext = t_exts[iE];
+	Vec3d Xc_body;
+	{
+		// Inverse extrinsics: R_ext^T * (Xc - t_ext)
+		Vec3d diff;
+		diff[0] = Xc[0] - t_ext[0];
+		diff[1] = Xc[1] - t_ext[1];
+		diff[2] = Xc[2] - t_ext[2];
+		// q_ext_inv = conjugate of q_ext (for unit quaternion)
+		Vec4d q_ext_inv;
+		q_ext_inv[0] = -q_ext[0]; q_ext_inv[1] = -q_ext[1]; q_ext_inv[2] = -q_ext[2]; q_ext_inv[3] = q_ext[3];
+		rotate(q_ext_inv, diff, Xc_body);
+	}
 	Scalar JP[MDIM * PDIM];
 	Scalar JL[MDIM * LDIM];
-	computeJacobians<MDIM>(Xc, q, JP, JL, camera);
+	computeJacobiansExact<MDIM>(Xc, Xc_body, q, q_ext, t_ext, JP, JL, camera);
 
 	if (!(flag & EDGE_FLAG_FIXED_P))
 	{
