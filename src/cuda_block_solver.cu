@@ -285,6 +285,42 @@ __device__ inline void projectC2I(const Vec3d& Xc, Vecxd<MDIM>& p, CameraParamVi
 {
 }
 
+// Kannala-Brandt equidistant projection model.
+// theta = atan2(sqrt(X^2+Y^2), Z)
+// theta_d = theta + k1*theta^3 + k2*theta^5 + k3*theta^7 + k4*theta^9
+// u = fx * (theta_d/r) * X + cx    where r = sqrt(X^2+Y^2)
+// v = fy * (theta_d/r) * Y + cy
+__device__ inline void projectC2I_equidistant(const Vec3d& Xc, Vec2d& p,
+	CameraParamView camera, const Scalar* distortion)
+{
+	const Scalar X = Xc[0];
+	const Scalar Y = Xc[1];
+	const Scalar Z = Xc[2];
+	const Scalar r = sqrt(X * X + Y * Y);
+	const Scalar eps = Scalar(1e-10);
+
+	if (r < eps) {
+		// Degenerate case: point on optical axis, use pinhole approximation
+		const Scalar invZ = 1 / Z;
+		p[0] = camera.fx() * invZ * X + camera.cx();
+		p[1] = camera.fy() * invZ * Y + camera.cy();
+		return;
+	}
+
+	const Scalar theta = atan2(r, Z);
+	const Scalar k1 = distortion[0];
+	const Scalar k2 = distortion[1];
+	const Scalar k3 = distortion[2];
+	const Scalar k4 = distortion[3];
+	const Scalar theta2 = theta * theta;
+	const Scalar theta3 = theta2 * theta;
+	const Scalar theta_d = theta + k1 * theta3 + k2 * theta2 * theta3
+		+ k3 * theta3 * theta3 * theta + k4 * theta3 * theta3 * theta3;
+	const Scalar scale = theta_d / r;
+	p[0] = camera.fx() * scale * X + camera.cx();
+	p[1] = camera.fy() * scale * Y + camera.cy();
+}
+
 template <>
 __device__ inline void projectC2I<2>(const Vec3d& Xc, Vec2d& p, CameraParamView camera)
 {
@@ -397,6 +433,143 @@ __device__ void computeJacobiansExact<2>(const Vec3d& Xc, const Vec3d& Xc_body, 
 	JP(1, 2) = Jpe[1][0] * (-Yb) + Jpe[1][1] * Xb;
 
 	// JP translation columns [3:6]: J_pi_ext
+	JP(0, 3) = Jpe[0][0];
+	JP(0, 4) = Jpe[0][1];
+	JP(0, 5) = Jpe[0][2];
+	JP(1, 3) = Jpe[1][0];
+	JP(1, 4) = Jpe[1][1];
+	JP(1, 5) = Jpe[1][2];
+}
+
+// Exact Jacobians for Kannala-Brandt equidistant projection model.
+// Uses chain rule: d(u,v)/d(Xc) for equidistant, then same extrinsics/pose chain as pinhole.
+__device__ void computeJacobiansExact_equidistant(const Vec3d& Xc, const Vec3d& Xc_body, const Vec4d& q,
+	const Vec4d& q_ext, const Vec3d& t_ext,
+	MatView2x6d JP, MatView2x3d JL, CameraParamView camera, const Scalar* distortion)
+{
+	const Scalar X = Xc[0];
+	const Scalar Y = Xc[1];
+	const Scalar Z = Xc[2];
+	const Scalar fu = camera.fx();
+	const Scalar fv = camera.fy();
+	const Scalar r = sqrt(X * X + Y * Y);
+	const Scalar eps = Scalar(1e-10);
+
+	// Jpi_equi: 2x3 projection Jacobian for equidistant model.
+	// NOTE: Following the existing codebase convention, Jpi stores the NEGATED
+	// Jacobian: Jpi = -d(proj)/d(Xc). This is consistent with the pinhole path.
+	Scalar Jpi[2][3];
+
+	if (r < eps) {
+		// Degenerate case: fall back to pinhole Jacobian (negated convention)
+		const Scalar invZ = 1 / Z;
+		const Scalar invZZ = invZ * invZ;
+		Jpi[0][0] = -fu * invZ;  Jpi[0][1] = 0;            Jpi[0][2] = fu * X * invZZ;
+		Jpi[1][0] = 0;           Jpi[1][1] = -fv * invZ;    Jpi[1][2] = fv * Y * invZZ;
+	}
+	else {
+		const Scalar r2 = r * r;
+		const Scalar r2_plus_Z2 = r2 + Z * Z;
+
+		const Scalar theta = atan2(r, Z);
+		const Scalar k1 = distortion[0];
+		const Scalar k2 = distortion[1];
+		const Scalar k3 = distortion[2];
+		const Scalar k4 = distortion[3];
+		const Scalar theta2 = theta * theta;
+		const Scalar theta4 = theta2 * theta2;
+		const Scalar theta6 = theta4 * theta2;
+		const Scalar theta8 = theta4 * theta4;
+		const Scalar theta3 = theta2 * theta;
+		const Scalar theta5 = theta4 * theta;
+		const Scalar theta7 = theta6 * theta;
+		const Scalar theta9 = theta8 * theta;
+		const Scalar theta_d = theta + k1 * theta3 + k2 * theta5 + k3 * theta7 + k4 * theta9;
+
+		// d(theta_d)/d(theta)
+		const Scalar dtheta_d_dtheta = 1 + 3 * k1 * theta2 + 5 * k2 * theta4
+			+ 7 * k3 * theta6 + 9 * k4 * theta8;
+
+		// Partial derivatives of theta w.r.t. X, Y, Z
+		// theta = atan2(r, Z), r = sqrt(X^2 + Y^2)
+		// d(theta)/d(X) = X*Z / (r * (r^2 + Z^2))
+		// d(theta)/d(Y) = Y*Z / (r * (r^2 + Z^2))
+		// d(theta)/d(Z) = -r / (r^2 + Z^2)
+		const Scalar dtheta_dX = X * Z / (r * r2_plus_Z2);
+		const Scalar dtheta_dY = Y * Z / (r * r2_plus_Z2);
+		const Scalar dtheta_dZ = -r / r2_plus_Z2;
+
+		// Partial derivatives of theta_d w.r.t. X, Y, Z
+		const Scalar dthetad_dX = dtheta_d_dtheta * dtheta_dX;
+		const Scalar dthetad_dY = dtheta_d_dtheta * dtheta_dY;
+		const Scalar dthetad_dZ = dtheta_d_dtheta * dtheta_dZ;
+
+		// Partial derivatives of r w.r.t. X, Y, Z
+		const Scalar dr_dX = X / r;
+		const Scalar dr_dY = Y / r;
+		// dr_dZ = 0
+
+		// s = theta_d / r
+		// ds/dX = (dthetad_dX * r - theta_d * dr_dX) / r^2
+		// ds/dY = (dthetad_dY * r - theta_d * dr_dY) / r^2
+		// ds/dZ = dthetad_dZ / r   (since dr_dZ = 0)
+		const Scalar inv_r2 = 1 / r2;
+		const Scalar ds_dX = (dthetad_dX * r - theta_d * dr_dX) * inv_r2;
+		const Scalar ds_dY = (dthetad_dY * r - theta_d * dr_dY) * inv_r2;
+		const Scalar ds_dZ = dthetad_dZ / r;
+
+		const Scalar s = theta_d / r;
+
+		// True derivatives (then negate to match convention):
+		// du/dX = fu * (s + X * ds_dX)
+		// du/dY = fu * X * ds_dY
+		// du/dZ = fu * X * ds_dZ
+		// Negated for consistency with pinhole path:
+		Jpi[0][0] = -(fu * (s + X * ds_dX));
+		Jpi[0][1] = -(fu * X * ds_dY);
+		Jpi[0][2] = -(fu * X * ds_dZ);
+
+		// dv/dX = fv * Y * ds_dX
+		// dv/dY = fv * (s + Y * ds_dY)
+		// dv/dZ = fv * Y * ds_dZ
+		Jpi[1][0] = -(fv * Y * ds_dX);
+		Jpi[1][1] = -(fv * (s + Y * ds_dY));
+		Jpi[1][2] = -(fv * Y * ds_dZ);
+	}
+
+	// The rest is identical to the pinhole path: chain through extrinsics and pose.
+
+	// R_ext: extrinsics rotation matrix
+	Matx<Scalar, 3, 3> Re;
+	quaternionToRotationMatrix(q_ext, Re);
+
+	// Jpe = Jpi * R_ext  (2x3)
+	Scalar Jpe[2][3];
+	for (int row = 0; row < 2; row++)
+		for (int col = 0; col < 3; col++)
+			Jpe[row][col] = Jpi[row][0] * Re(0, col) + Jpi[row][1] * Re(1, col) + Jpi[row][2] * Re(2, col);
+
+	// R_body
+	Matx<Scalar, 3, 3> Rb;
+	quaternionToRotationMatrix(q, Rb);
+
+	// JL = Jpe * R_body  (2x3)
+	for (int row = 0; row < 2; row++)
+		for (int col = 0; col < 3; col++)
+			JL(row, col) = Jpe[row][0] * Rb(0, col) + Jpe[row][1] * Rb(1, col) + Jpe[row][2] * Rb(2, col);
+
+	// JP rotation columns [0:3]: Jpe * [-Xc_body x]
+	const Scalar Xb = Xc_body[0];
+	const Scalar Yb = Xc_body[1];
+	const Scalar Zb = Xc_body[2];
+	JP(0, 0) = Jpe[0][1] * (-Zb) + Jpe[0][2] * Yb;
+	JP(0, 1) = Jpe[0][0] * Zb + Jpe[0][2] * (-Xb);
+	JP(0, 2) = Jpe[0][0] * (-Yb) + Jpe[0][1] * Xb;
+	JP(1, 0) = Jpe[1][1] * (-Zb) + Jpe[1][2] * Yb;
+	JP(1, 1) = Jpe[1][0] * Zb + Jpe[1][2] * (-Xb);
+	JP(1, 2) = Jpe[1][0] * (-Yb) + Jpe[1][1] * Xb;
+
+	// JP translation columns [3:6]: Jpe
 	JP(0, 3) = Jpe[0][0];
 	JP(0, 4) = Jpe[0][1];
 	JP(0, 5) = Jpe[0][2];
@@ -785,7 +958,7 @@ struct RobustKernelFunc<RobustKernelType::TUKEY>
 template <int MDIM, int RK_TYPE>
 __global__ void computeActiveErrorsKernel(int nedges, const Vec4d* qs, const Vec3d* ts, const Vec5d* cameras,
 	const Vec3d* Xws, const Vecxd<MDIM>* measurements, const Scalar* omegas, const Vec2i* edge2PL,
-	const Vec4d* q_exts, const Vec3d* t_exts,
+	const Vec4d* q_exts, const Vec3d* t_exts, const Vec4d* distortions,
 	RobustKernelFunc<RK_TYPE> robustKernel, Vecxd<MDIM>* errors, Vec3d* Xcs, Scalar* chi)
 {
 	using Vecmd = Vecxd<MDIM>;
@@ -814,9 +987,23 @@ __global__ void computeActiveErrorsKernel(int nedges, const Vec4d* qs, const Vec
 		Vec3d Xc;
 		applyExtrinsics(q_exts[iE], t_exts[iE], Xc_body, Xc);
 
-		// project camera to image
+		// project camera to image: equidistant if distortion is non-zero (2D only)
 		Vecmd proj;
-		projectC2I(Xc, proj, camera);
+		if (MDIM == 2 && distortions != nullptr)
+		{
+			const Scalar* dist = distortions[iE].data;
+			const bool use_equidistant = (dist[0] != 0 || dist[1] != 0 || dist[2] != 0 || dist[3] != 0);
+			if (use_equidistant) {
+				// Only valid for MDIM==2 (monocular); cast through pointer to satisfy compiler
+				projectC2I_equidistant(Xc, *reinterpret_cast<Vec2d*>(&proj), camera, dist);
+			} else {
+				projectC2I(Xc, proj, camera);
+			}
+		}
+		else
+		{
+			projectC2I(Xc, proj, camera);
+		}
 
 		// compute residual
 		Vecmd error;
@@ -847,7 +1034,7 @@ template <int MDIM, int RK_TYPE>
 __global__ void constructQuadraticFormKernel(int nedges, const Vec3d* Xcs, const Vec4d* qs, const Vec5d* cameras, const Vecxd<MDIM>* errors,
 	const Scalar* omegas, const Vec2i* edge2PL, const int* edge2Hpl, const uint8_t* flags, RobustKernelFunc<RK_TYPE> robustKernel,
 	PxPBlockPtr Hpp, Px1BlockPtr bp, LxLBlockPtr Hll, Lx1BlockPtr bl, PxLBlockPtr Hpl,
-	const Vec4d* q_exts, const Vec3d* t_exts)
+	const Vec4d* q_exts, const Vec3d* t_exts, const Vec4d* distortions)
 {
 	using Vecmd = Vecxd<MDIM>;
 
@@ -888,27 +1075,43 @@ __global__ void constructQuadraticFormKernel(int nedges, const Vec3d* Xcs, const
 	}
 	Scalar JP[MDIM * PDIM];
 	Scalar JL[MDIM * LDIM];
-	computeJacobiansExact<MDIM>(Xc, Xc_body, q, q_ext, t_ext, JP, JL, camera);
+
+	// Select Jacobian: equidistant for 2D edges with non-zero distortion, pinhole otherwise
+	if (MDIM == 2 && distortions != nullptr)
+	{
+		const Scalar* dist = distortions[iE].data;
+		const bool use_equidistant = (dist[0] != 0 || dist[1] != 0 || dist[2] != 0 || dist[3] != 0);
+		if (use_equidistant) {
+			computeJacobiansExact_equidistant(Xc, Xc_body, q, q_ext, t_ext,
+				MatView2x6d(JP), MatView2x3d(JL), camera, dist);
+		} else {
+			computeJacobiansExact<MDIM>(Xc, Xc_body, q, q_ext, t_ext, JP, JL, camera);
+		}
+	}
+	else
+	{
+		computeJacobiansExact<MDIM>(Xc, Xc_body, q, q_ext, t_ext, JP, JL, camera);
+	}
 
 	if (!(flag & EDGE_FLAG_FIXED_P))
 	{
-		// Hpp += = JPT*Ω*JP
+		// Hpp += = JPT*Omega*JP
 		MatTMulMat<PDIM, MDIM, PDIM, ACCUM_ATOMIC>(JP, JP, Hpp.at(iP), omega);
 
-		// bp += = JPT*Ω*r
+		// bp += = JPT*Omega*r
 		MatTMulVec<PDIM, MDIM, ACCUM_ATOMIC>(JP, error.data, bp.at(iP), omega);
 	}
 	if (!(flag & EDGE_FLAG_FIXED_L))
 	{
-		// Hll += = JLT*Ω*JL
+		// Hll += = JLT*Omega*JL
 		MatTMulMat<LDIM, MDIM, LDIM, ACCUM_ATOMIC>(JL, JL, Hll.at(iL), omega);
 
-		// bl += = JLT*Ω*r
+		// bl += = JLT*Omega*r
 		MatTMulVec<LDIM, MDIM, ACCUM_ATOMIC>(JL, error.data, bl.at(iL), omega);
 	}
 	if (!flag)
 	{
-		// Hpl += = JPT*Ω*JL
+		// Hpl += = JPT*Omega*JL
 		MatTMulMat<PDIM, MDIM, LDIM, ASSIGN>(JP, JL, Hpl.at(edge2Hpl[iE]), omega);
 	}
 }
@@ -916,7 +1119,7 @@ __global__ void constructQuadraticFormKernel(int nedges, const Vec3d* Xcs, const
 template <int MDIM>
 __global__ void computeChiSquaresKernel(int nedges, const Vec4d* qs, const Vec3d* ts, const Vec5d* cameras,
 	const Vec3d* Xws, const Vecxd<MDIM>* measurements, const Scalar* omegas, const Vec2i* edge2PL,
-	const Vec4d* q_exts, const Vec3d* t_exts, Scalar* chiSqs)
+	const Vec4d* q_exts, const Vec3d* t_exts, const Vec4d* distortions, Scalar* chiSqs)
 {
 	using Vecmd = Vecxd<MDIM>;
 
@@ -942,9 +1145,22 @@ __global__ void computeChiSquaresKernel(int nedges, const Vec4d* qs, const Vec3d
 	Vec3d Xc;
 	applyExtrinsics(q_exts[iE], t_exts[iE], Xc_body, Xc);
 
-	// project camera to image
+	// project camera to image: equidistant if distortion is non-zero (2D only)
 	Vecmd proj;
-	projectC2I(Xc, proj, camera);
+	if (MDIM == 2 && distortions != nullptr)
+	{
+		const Scalar* dist = distortions[iE].data;
+		const bool use_equidistant = (dist[0] != 0 || dist[1] != 0 || dist[2] != 0 || dist[3] != 0);
+		if (use_equidistant) {
+			projectC2I_equidistant(Xc, *reinterpret_cast<Vec2d*>(&proj), camera, dist);
+		} else {
+			projectC2I(Xc, proj, camera);
+		}
+	}
+	else
+	{
+		projectC2I(Xc, proj, camera);
+	}
 
 	// compute residual
 	Vecmd error;
@@ -1276,7 +1492,7 @@ void findHschureMulBlockIndices(const GpuHplBlockMat& Hpl, const GpuHscBlockMat&
 template <int MDIM, int RK_TYPE = 0>
 Scalar computeActiveErrors_(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5d& cameras, const GpuVec3d& Xws,
 	const GpuVecAny& _measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL,
-	const GpuVec4d& q_exts, const GpuVec3d& t_exts,
+	const GpuVec4d& q_exts, const GpuVec3d& t_exts, const GpuVec4d& distortions,
 	Scalar robustDelta,
 	const GpuVecAny& _errors, GpuVec3d& Xcs, Scalar* chi)
 {
@@ -1292,9 +1508,13 @@ Scalar computeActiveErrors_(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec
 	if (nedges <= 0)
 		return 0;
 
+	// Pass distortion pointer only for 2D edges that have data uploaded
+	const Vec4d* d_dist_ptr = (MDIM == 2 && distortions.size() > 0)
+		? static_cast<const Vec4d*>(distortions) : nullptr;
+
 	CUDA_CHECK(cudaMemset(chi, 0, sizeof(Scalar)));
 	computeActiveErrorsKernel<MDIM, RK_TYPE><<<grid, block>>>(nedges, qs, ts, cameras, Xws, measurements, omegas,
-		edge2PL, q_exts, t_exts, robustKernel, errors, Xcs, chi);
+		edge2PL, q_exts, t_exts, d_dist_ptr, robustKernel, errors, Xcs, chi);
 	CUDA_CHECK(cudaGetLastError());
 
 	Scalar h_chi = 0;
@@ -1304,7 +1524,7 @@ Scalar computeActiveErrors_(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec
 }
 
 using ComputeActiveErrorsFunc = Scalar(*)(const GpuVec4d&, const GpuVec3d&, const GpuVec5d&, const GpuVec3d&,
-	const GpuVecAny&, const GpuVec1d&, const GpuVec2i&, const GpuVec4d&, const GpuVec3d&,
+	const GpuVecAny&, const GpuVec1d&, const GpuVec2i&, const GpuVec4d&, const GpuVec3d&, const GpuVec4d&,
 	Scalar, const GpuVecAny&, GpuVec3d&, Scalar*);
 
 static ComputeActiveErrorsFunc computeActiveErrorsFuncs[6] =
@@ -1319,12 +1539,12 @@ static ComputeActiveErrorsFunc computeActiveErrorsFuncs[6] =
 
 Scalar computeActiveErrors(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5d& cameras, const GpuVec3d& Xws,
 	const GpuVec2d& measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL,
-	const GpuVec4d& q_exts, const GpuVec3d& t_exts,
+	const GpuVec4d& q_exts, const GpuVec3d& t_exts, const GpuVec4d& distortions,
 	const RobustKernel& kernel,
 	GpuVec2d& errors, GpuVec3d& Xcs, Scalar* chi)
 {
 	auto func = computeActiveErrorsFuncs[0 + kernel.type];
-	return func(qs, ts, cameras, Xws, measurements, omegas, edge2PL, q_exts, t_exts, kernel.delta, errors, Xcs, chi);
+	return func(qs, ts, cameras, Xws, measurements, omegas, edge2PL, q_exts, t_exts, distortions, kernel.delta, errors, Xcs, chi);
 }
 
 Scalar computeActiveErrors(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5d& cameras, const GpuVec3d& Xws,
@@ -1333,14 +1553,16 @@ Scalar computeActiveErrors(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5
 	const RobustKernel& kernel,
 	GpuVec3d& errors, GpuVec3d& Xcs, Scalar* chi)
 {
+	// 3D (stereo) path: no distortion support, pass empty GpuVec4d
+	static GpuVec4d empty_distortions;
 	auto func = computeActiveErrorsFuncs[3 + kernel.type];
-	return func(qs, ts, cameras, Xws, measurements, omegas, edge2PL, q_exts, t_exts, kernel.delta, errors, Xcs, chi);
+	return func(qs, ts, cameras, Xws, measurements, omegas, edge2PL, q_exts, t_exts, empty_distortions, kernel.delta, errors, Xcs, chi);
 }
 
 template <int MDIM, int RK_TYPE = 0>
 void constructQuadraticForm_(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVec5d& cameras, const GpuVecAny& _errors,
 	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1b& flags,
-	const GpuVec4d& q_exts, const GpuVec3d& t_exts,
+	const GpuVec4d& q_exts, const GpuVec3d& t_exts, const GpuVec4d& distortions,
 	Scalar robustDelta,
 	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuHplBlockMat& Hpl)
 {
@@ -1354,15 +1576,19 @@ void constructQuadraticForm_(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuV
 	if (nedges <= 0)
 		return;
 
+	// Pass distortion pointer only for 2D edges that have data uploaded
+	const Vec4d* d_dist_ptr = (MDIM == 2 && distortions.size() > 0)
+		? static_cast<const Vec4d*>(distortions) : nullptr;
+
 	constructQuadraticFormKernel<MDIM, RK_TYPE><<<grid, block>>>(nedges, Xcs, qs, cameras, errors, omegas,
 		edge2PL, edge2Hpl, flags, robustKernel, Hpp, bp, Hll, bl, Hpl,
-		q_exts, t_exts);
+		q_exts, t_exts, d_dist_ptr);
 	CUDA_CHECK(cudaGetLastError());
 }
 
 using ConstructQuadraticFormFunc = void(*)(const GpuVec3d&, const GpuVec4d&, const GpuVec5d&, const GpuVecAny&,
 	const GpuVec1d&, const GpuVec2i&, const GpuVec1i&, const GpuVec1b&,
-	const GpuVec4d&, const GpuVec3d&, Scalar,
+	const GpuVec4d&, const GpuVec3d&, const GpuVec4d&, Scalar,
 	GpuPxPBlockVec&, GpuPx1BlockVec&, GpuLxLBlockVec&, GpuLx1BlockVec&, GpuHplBlockMat&);
 
 static ConstructQuadraticFormFunc constructQuadraticFormFuncs[6] =
@@ -1377,12 +1603,12 @@ static ConstructQuadraticFormFunc constructQuadraticFormFuncs[6] =
 
 void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVec5d& cameras, const GpuVec2d& errors,
 	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1b& flags,
-	const GpuVec4d& q_exts, const GpuVec3d& t_exts,
+	const GpuVec4d& q_exts, const GpuVec3d& t_exts, const GpuVec4d& distortions,
 	const RobustKernel& kernel,
 	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuHplBlockMat& Hpl)
 {
 	auto func = constructQuadraticFormFuncs[0 + kernel.type];
-	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, flags, q_exts, t_exts, kernel.delta, Hpp, bp, Hll, bl, Hpl);
+	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, flags, q_exts, t_exts, distortions, kernel.delta, Hpp, bp, Hll, bl, Hpl);
 }
 
 void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVec5d& cameras, const GpuVec3d& errors,
@@ -1391,14 +1617,16 @@ void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVe
 	const RobustKernel& kernel,
 	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuHplBlockMat& Hpl)
 {
+	// 3D (stereo) path: no distortion support, pass empty GpuVec4d
+	static GpuVec4d empty_distortions;
 	auto func = constructQuadraticFormFuncs[3 + kernel.type];
-	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, flags, q_exts, t_exts, kernel.delta, Hpp, bp, Hll, bl, Hpl);
+	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, flags, q_exts, t_exts, empty_distortions, kernel.delta, Hpp, bp, Hll, bl, Hpl);
 }
 
 template <int MDIM>
 void computeChiSquares_(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5d& cameras, const GpuVec3d& Xws,
 	const GpuVecAny& _measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL,
-	const GpuVec4d& q_exts, const GpuVec3d& t_exts, GpuVec1d& chiSqs)
+	const GpuVec4d& q_exts, const GpuVec3d& t_exts, const GpuVec4d& distortions, GpuVec1d& chiSqs)
 {
 	prepareCudaThreadContext();
 	using Vecmd = Vecxd<MDIM>;
@@ -1412,23 +1640,29 @@ void computeChiSquares_(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5d& 
 	if (nedges <= 0)
 		return;
 
+	// Pass distortion pointer only for 2D edges that have data uploaded
+	const Vec4d* d_dist_ptr = (MDIM == 2 && distortions.size() > 0)
+		? static_cast<const Vec4d*>(distortions) : nullptr;
+
 	computeChiSquaresKernel<MDIM><<<grid, block>>>(nedges, qs, ts, cameras, Xws, measurements, omegas, edge2PL,
-		q_exts, t_exts, chiSqs);
+		q_exts, t_exts, d_dist_ptr, chiSqs);
 	CUDA_CHECK(cudaGetLastError());
 }
 
 void computeChiSquares(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5d& cameras, const GpuVec3d& Xws,
 	const GpuVec2d& measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL,
-	const GpuVec4d& q_exts, const GpuVec3d& t_exts, GpuVec1d& chiSqs)
+	const GpuVec4d& q_exts, const GpuVec3d& t_exts, const GpuVec4d& distortions, GpuVec1d& chiSqs)
 {
-	computeChiSquares_<2>(qs, ts, cameras, Xws, measurements, omegas, edge2PL, q_exts, t_exts, chiSqs);
+	computeChiSquares_<2>(qs, ts, cameras, Xws, measurements, omegas, edge2PL, q_exts, t_exts, distortions, chiSqs);
 }
 
 void computeChiSquares(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5d& cameras, const GpuVec3d& Xws,
 	const GpuVec3d& measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL,
 	const GpuVec4d& q_exts, const GpuVec3d& t_exts, GpuVec1d& chiSqs)
 {
-	computeChiSquares_<3>(qs, ts, cameras, Xws, measurements, omegas, edge2PL, q_exts, t_exts, chiSqs);
+	// 3D (stereo) path: no distortion support
+	static GpuVec4d empty_distortions;
+	computeChiSquares_<3>(qs, ts, cameras, Xws, measurements, omegas, edge2PL, q_exts, t_exts, empty_distortions, chiSqs);
 }
 
 template <typename T, int DIM>

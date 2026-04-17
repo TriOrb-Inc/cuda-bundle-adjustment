@@ -131,6 +131,7 @@ public:
 		HplBlockPos_.clear();
 		q_exts_.clear();
 		t_exts_.clear();
+		distortions_.clear();
 
 		numP_ = numL_ = nedges2D_ = nedges3D_ = nHplBlocks_ = 0;
 		optimizeP_ = optimizeL_ = false;
@@ -164,6 +165,7 @@ public:
 		edgeFlags_.reserve(edgeSet2D.size() + edgeSet3D.size());
 		q_exts_.reserve(edgeSet2D.size() + edgeSet3D.size());
 		t_exts_.reserve(edgeSet2D.size() + edgeSet3D.size());
+		distortions_.reserve(edgeSet2D.size());
 
 		std::vector<VertexP*> fixedVerticesP_;
 		std::vector<VertexL*> fixedVerticesL_;
@@ -263,6 +265,20 @@ public:
 					const double zero_t[3] = { 0.0, 0.0, 0.0 };
 					q_exts_.emplace_back(identity_q);
 					t_exts_.emplace_back(zero_t);
+				}
+
+				// Per-edge distortion coefficients (Kannala-Brandt equidistant model).
+				{
+					Vec4d dist;
+					if (e->hasDistortion) {
+						dist[0] = ScalarCast(e->distortion[0]);
+						dist[1] = ScalarCast(e->distortion[1]);
+						dist[2] = ScalarCast(e->distortion[2]);
+						dist[3] = ScalarCast(e->distortion[3]);
+					} else {
+						dist[0] = 0; dist[1] = 0; dist[2] = 0; dist[3] = 0;
+					}
+					distortions_.emplace_back(dist);
 				}
 
 				edgeId++;
@@ -429,6 +445,9 @@ public:
 		d_t_exts_2D_.assign(nedges2D_, t_exts_.data());
 		d_t_exts_3D_.assign(nedges3D_, t_exts_.data() + nedges2D_);
 
+		// upload per-edge distortion coefficients to device memory (2D only)
+		d_distortions_2D_.assign(nedges2D_, distortions_.data());
+
 		d_chi_.resize(1);
 
 		d_chiSqs_.resize(baseEdges_.size());
@@ -459,7 +478,7 @@ public:
 		const auto t0 = get_time_point();
 
 		const Scalar chi2D = gpu::computeActiveErrors(d_qs_, d_ts_, d_cameras_, d_Xws_, d_measurements2D_,
-			d_omegas2D_, d_edge2PL2D_, d_q_exts_2D_, d_t_exts_2D_, kernels_[0], d_errors2D_, d_Xcs2D_, d_chi_);
+			d_omegas2D_, d_edge2PL2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, kernels_[0], d_errors2D_, d_Xcs2D_, d_chi_);
 
 		const Scalar chi3D = gpu::computeActiveErrors(d_qs_, d_ts_, d_cameras_, d_Xws_, d_measurements3D_,
 			d_omegas3D_, d_edge2PL3D_, d_q_exts_3D_, d_t_exts_3D_, kernels_[1], d_errors3D_, d_Xcs3D_, d_chi_);
@@ -489,7 +508,7 @@ public:
 		d_bl_.fillZero();
 
 		gpu::constructQuadraticForm(d_Xcs2D_, d_qs_, d_cameras_, d_errors2D_, d_omegas2D_, d_edge2PL2D_,
-			d_edge2Hpl2D_, d_edgeFlags2D_, d_q_exts_2D_, d_t_exts_2D_, kernels_[0], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_);
+			d_edge2Hpl2D_, d_edgeFlags2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, kernels_[0], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_);
 
 		gpu::constructQuadraticForm(d_Xcs3D_, d_qs_, d_cameras_, d_errors3D_, d_omegas3D_, d_edge2PL3D_,
 			d_edge2Hpl3D_, d_edgeFlags3D_, d_q_exts_3D_, d_t_exts_3D_, kernels_[1], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_);
@@ -630,7 +649,7 @@ public:
 
 		// compute chi-squares
 		gpu::computeChiSquares(d_qs_, d_ts_, d_cameras_, d_Xws_, d_measurements2D_,
-			d_omegas2D_, d_edge2PL2D_, d_q_exts_2D_, d_t_exts_2D_, d_chiSqs2D_);
+			d_omegas2D_, d_edge2PL2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, d_chiSqs2D_);
 		gpu::computeChiSquares(d_qs_, d_ts_, d_cameras_, d_Xws_, d_measurements3D_,
 			d_omegas3D_, d_edge2PL3D_, d_q_exts_3D_, d_t_exts_3D_, d_chiSqs3D_);
 		d_chiSqs_.download(chiSqs_.data());
@@ -696,6 +715,9 @@ private:
 	std::vector<Vec4d> q_exts_;
 	std::vector<Vec3d> t_exts_;
 
+	// per-edge distortion coefficients [k1, k2, k3, k4] (2D edges only)
+	std::vector<Vec4d> distortions_;
+
 	// block matrices
 	HplSparseBlockMatrix Hpl_;
 	HschurSparseBlockMatrix Hsc_;
@@ -731,6 +753,9 @@ private:
 	// per-edge extrinsics on device
 	GpuVec4d d_q_exts_2D_, d_q_exts_3D_;
 	GpuVec3d d_t_exts_2D_, d_t_exts_3D_;
+
+	// per-edge distortion on device (2D only)
+	GpuVec4d d_distortions_2D_;
 
 	// solution increments Δx = [Δxp Δxl]
 	GpuVec1d d_x_;
