@@ -102,7 +102,8 @@ struct Edge : BaseEdge
 	*/
 	Edge() : measurement(Measurement()), information(Information()),
 		vertexP(nullptr), vertexL(nullptr), hasExtrinsics(false),
-		q_ext(Eigen::Quaterniond::Identity()), t_ext(Eigen::Vector3d::Zero()) {}
+		q_ext(Eigen::Quaterniond::Identity()), t_ext(Eigen::Vector3d::Zero()),
+		hasDistortion(false), distortion{0, 0, 0, 0} {}
 
 	/** @brief The constructor.
 	@param m measurement vector.
@@ -112,7 +113,8 @@ struct Edge : BaseEdge
 	*/
 	Edge(const Measurement& m, Information I, PoseVertex* vertexP, LandmarkVertex* vertexL) :
 		measurement(m), information(I), vertexP(vertexP), vertexL(vertexL),
-		hasExtrinsics(false), q_ext(Eigen::Quaterniond::Identity()), t_ext(Eigen::Vector3d::Zero()) {}
+		hasExtrinsics(false), q_ext(Eigen::Quaterniond::Identity()), t_ext(Eigen::Vector3d::Zero()),
+		hasDistortion(false), distortion{0, 0, 0, 0} {}
 
 	/** @brief Returns the connected pose vertex.
 	*/
@@ -139,6 +141,15 @@ struct Edge : BaseEdge
 	bool hasExtrinsics;
 	Eigen::Quaterniond q_ext;  //!< rotation component of camera_from_body extrinsics.
 	Eigen::Vector3d t_ext;     //!< translation component of camera_from_body extrinsics.
+
+	// Per-edge distortion: Kannala-Brandt equidistant model coefficients.
+	// When hasDistortion is true, projection uses the equidistant model:
+	//   θ = atan2(√(X²+Y²), Z)
+	//   θ_d = θ + k1·θ³ + k2·θ⁵ + k3·θ⁷ + k4·θ⁹
+	//   u = fx · θ_d · X/√(X²+Y²) + cx
+	// instead of pinhole: u = fx · X/Z + cx
+	bool hasDistortion;
+	double distortion[4];  //!< [k1, k2, k3, k4]
 };
 
 /** @brief Edge with 2-dimensional measurement (monocular observation).
