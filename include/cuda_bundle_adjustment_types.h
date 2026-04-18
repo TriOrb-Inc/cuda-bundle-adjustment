@@ -67,6 +67,7 @@ struct CameraParams
 
 struct PoseVertex;
 struct LandmarkVertex;
+struct ExtrinsicsVertex;
 
 /** @brief Base edge struct.
 */
@@ -79,6 +80,10 @@ struct BaseEdge
 	/** @brief Returns the connected landmark vertex.
 	*/
 	virtual LandmarkVertex* landmarkVertex() const = 0;
+
+	/** @brief Returns the connected extrinsics vertex (nullptr if unused).
+	*/
+	virtual ExtrinsicsVertex* extrinsicsVertex() const { return nullptr; }
 
 	/** @brief Returns the dimension of measurement.
 	*/
@@ -101,7 +106,7 @@ struct Edge : BaseEdge
 	/** @brief The constructor.
 	*/
 	Edge() : measurement(Measurement()), information(Information()),
-		vertexP(nullptr), vertexL(nullptr), hasExtrinsics(false),
+		vertexP(nullptr), vertexL(nullptr), vertexE(nullptr), hasExtrinsics(false),
 		q_ext(Eigen::Quaterniond::Identity()), t_ext(Eigen::Vector3d::Zero()),
 		hasDistortion(false), distortion{0, 0, 0, 0} {}
 
@@ -112,7 +117,7 @@ struct Edge : BaseEdge
 	@param vertexL connected landmark vertex.
 	*/
 	Edge(const Measurement& m, Information I, PoseVertex* vertexP, LandmarkVertex* vertexL) :
-		measurement(m), information(I), vertexP(vertexP), vertexL(vertexL),
+		measurement(m), information(I), vertexP(vertexP), vertexL(vertexL), vertexE(nullptr),
 		hasExtrinsics(false), q_ext(Eigen::Quaterniond::Identity()), t_ext(Eigen::Vector3d::Zero()),
 		hasDistortion(false), distortion{0, 0, 0, 0} {}
 
@@ -124,6 +129,10 @@ struct Edge : BaseEdge
 	*/
 	LandmarkVertex* landmarkVertex() const override { return vertexL; }
 
+	/** @brief Returns the connected extrinsics vertex (nullptr if unused).
+	*/
+	ExtrinsicsVertex* extrinsicsVertex() const override { return vertexE; }
+
 	/** @brief Returns the dimension of measurement.
 	*/
 	int dim() const override { return DIM; }
@@ -132,12 +141,15 @@ struct Edge : BaseEdge
 	Information information; //!< information matrix (represented by a scalar for performance).
 	PoseVertex* vertexP;     //!< connected pose vertex.
 	LandmarkVertex* vertexL; //!< connected landmark vertex.
+	ExtrinsicsVertex* vertexE; //!< connected per-camera extrinsics vertex (nullptr if unused).
 
 	// Per-edge extrinsics: camera_optical_from_body transform.
 	// When hasExtrinsics is true, projection uses:
 	//   p_cam = R_ext * (R_body * Xw + t_body) + t_ext
 	// instead of:
 	//   p_cam = R_body * Xw + t_body
+	// When vertexE != nullptr, vertexE->q / vertexE->t override q_ext / t_ext
+	// at solver-initialize time (per-camera shared extrinsics).
 	bool hasExtrinsics;
 	Eigen::Quaterniond q_ext;  //!< rotation component of camera_from_body extrinsics.
 	Eigen::Vector3d t_ext;     //!< translation component of camera_from_body extrinsics.
@@ -226,6 +238,32 @@ struct LandmarkVertex
 	bool fixed;              //!< if true, the state variables are fixed during optimization.
 	int id;                  //!< ID of the vertex.
 	int iL;                  //!< ID of the vertex (internally used).
+	Set<BaseEdge*> edges;    //!< connected edges.
+};
+
+/** @brief Per-camera extrinsics vertex (6-DOF SE(3), stored as quaternion + translation).
+
+The extrinsics represent `camera_optical_from_body` and are shared by every edge
+belonging to the same physical camera. In P1.1 the vertex is created but held
+fixed (fixed=true), so values are routed through the existing per-edge
+`q_exts_`/`t_exts_` path without changing optimization dynamics. P1.2 will add
+Jacobian contributions and allow optimization.
+*/
+struct ExtrinsicsVertex
+{
+	using Rotation = Eigen::Quaterniond;
+	using Translation = Array<double, 3>;
+
+	ExtrinsicsVertex() : q(Rotation::Identity()), t(Translation::Zero()), fixed(true), id(-1), iE(-1) {}
+
+	ExtrinsicsVertex(int id, const Rotation& q, const Translation& t, bool fixed = true)
+		: q(q), t(t), fixed(fixed), id(id), iE(-1) {}
+
+	Rotation q;              //!< rotation component (unit quaternion).
+	Translation t;           //!< translation component.
+	bool fixed;              //!< if true, the state variables are fixed during optimization.
+	int id;                  //!< ID of the vertex (external).
+	int iE;                  //!< ID of the vertex (internally used).
 	Set<BaseEdge*> edges;    //!< connected edges.
 };
 

@@ -58,6 +58,7 @@ static constexpr int EDGE_TYPE_NUM = static_cast<int>(EdgeType::COUNT);
 
 using VertexMapP = std::map<int, VertexP*>;
 using VertexMapL = std::map<int, VertexL*>;
+using VertexMapE = std::map<int, ExtrinsicsVertex*>;
 using EdgeSet2D = std::unordered_set<Edge2D*>;
 using EdgeSet3D = std::unordered_set<Edge3D*>;
 using time_point = decltype(std::chrono::steady_clock::now());
@@ -252,8 +253,14 @@ public:
 				edge2PL_.push_back({ vertexP->iP, vertexL->iL });
 				edgeFlags_.push_back(makeEdgeFlag(vertexP->fixed, vertexL->fixed));
 
-				// Per-edge extrinsics: store quaternion [x,y,z,w] and translation.
-				if (e->hasExtrinsics)
+				// Per-edge extrinsics: prefer vertexE if present (P1.1 scaffold),
+				// else fall back to per-edge q_ext/t_ext.
+				if (e->vertexE != nullptr)
+				{
+					q_exts_.emplace_back(e->vertexE->q.coeffs().data());
+					t_exts_.emplace_back(e->vertexE->t.data());
+				}
+				else if (e->hasExtrinsics)
 				{
 					q_exts_.emplace_back(e->q_ext.coeffs().data());
 					t_exts_.emplace_back(e->t_ext.data());
@@ -303,8 +310,13 @@ public:
 				edge2PL_.push_back({ vertexP->iP, vertexL->iL });
 				edgeFlags_.push_back(makeEdgeFlag(vertexP->fixed, vertexL->fixed));
 
-				// Per-edge extrinsics: store quaternion [x,y,z,w] and translation.
-				if (e->hasExtrinsics)
+				// Per-edge extrinsics: prefer vertexE if present, else fall back to q_ext/t_ext.
+				if (e->vertexE != nullptr)
+				{
+					q_exts_.emplace_back(e->vertexE->q.coeffs().data());
+					t_exts_.emplace_back(e->vertexE->t.data());
+				}
+				else if (e->hasExtrinsics)
 				{
 					q_exts_.emplace_back(e->q_ext.coeffs().data());
 					t_exts_.emplace_back(e->t_ext.data());
@@ -818,12 +830,20 @@ public:
 		vertexMapL_.insert({ v->id, v });
 	}
 
+	void addExtrinsicsVertex(ExtrinsicsVertex* v) override
+	{
+		vertexMapE_.insert({ v->id, v });
+	}
+
 	void addMonocularEdge(Edge2D* e) override
 	{
 		edges2D_.insert(e);
 
 		e->vertexP->edges.insert(e);
 		e->vertexL->edges.insert(e);
+		if (e->vertexE != nullptr) {
+			e->vertexE->edges.insert(e);
+		}
 	}
 
 	void addStereoEdge(Edge3D* e) override
@@ -832,6 +852,9 @@ public:
 
 		e->vertexP->edges.insert(e);
 		e->vertexL->edges.insert(e);
+		if (e->vertexE != nullptr) {
+			e->vertexE->edges.insert(e);
+		}
 	}
 
 	VertexP* poseVertex(int id) const override
@@ -842,6 +865,12 @@ public:
 	VertexL* landmarkVertex(int id) const override
 	{
 		return vertexMapL_.at(id);
+	}
+
+	ExtrinsicsVertex* extrinsicsVertex(int id) const override
+	{
+		auto it = vertexMapE_.find(id);
+		return it == vertexMapE_.end() ? nullptr : it->second;
 	}
 
 	void removePoseVertex(PoseVertex* v) override
@@ -877,6 +906,11 @@ public:
 		auto vertexL = e->landmarkVertex();
 		if (vertexL->edges.count(e))
 			vertexL->edges.erase(e);
+
+		if (auto vertexE = e->extrinsicsVertex()) {
+			if (vertexE->edges.count(e))
+				vertexE->edges.erase(e);
+		}
 
 		if (e->dim() == 2)
 		{
@@ -1009,6 +1043,7 @@ public:
 	{
 		vertexMapP_.clear();
 		vertexMapL_.clear();
+		vertexMapE_.clear();
 		edges2D_.clear();
 		edges3D_.clear();
 		stats_.clear();
@@ -1042,6 +1077,7 @@ private:
 	CudaBlockSolver solver_;
 	VertexMapP vertexMapP_;
 	VertexMapL vertexMapL_;
+	VertexMapE vertexMapE_;
 	EdgeSet2D edges2D_;
 	EdgeSet3D edges3D_;
 	RobustKernel kernels_[EDGE_TYPE_NUM];

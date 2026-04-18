@@ -49,6 +49,10 @@ public:
 	*/
 	virtual void addLandmarkVertex(LandmarkVertex* v) = 0;
 
+	/** @brief Adds a per-camera extrinsics vertex to the graph.
+	*/
+	virtual void addExtrinsicsVertex(ExtrinsicsVertex* v) = 0;
+
 	/** @brief Adds an edge with monocular observation to the graph.
 	*/
 	virtual void addMonocularEdge(MonoEdge* e) = 0;
@@ -64,6 +68,10 @@ public:
 	/** @brief Returns the landmark vertex with specified id.
 	*/
 	virtual LandmarkVertex* landmarkVertex(int id) const = 0;
+
+	/** @brief Returns the extrinsics vertex with specified id (nullptr if missing).
+	*/
+	virtual ExtrinsicsVertex* extrinsicsVertex(int id) const = 0;
 
 	/** @brief Removes a pose vertex from the graph.
 	*/
