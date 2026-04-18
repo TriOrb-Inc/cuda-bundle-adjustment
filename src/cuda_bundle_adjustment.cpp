@@ -536,15 +536,17 @@ public:
 			d_HppBackup_.resize(numP_);
 		}
 
-		// Option 4 Phase 2: when deterministic accumulation is enabled and the
-		// joint extrinsics path is active, allocate a fixed-point int64 buffer
-		// that mirrors d_Hpp_.values() layout. The kernel routes ext-range
-		// atomicAdd writes into this buffer; convertFixedPointHppExtRange() then
-		// propagates the ext slots back into d_Hpp_ after each buildSystem().
-		// Body-range slots remain zero in this buffer and are never read back.
+		// Option 4 Phase 2+: when deterministic accumulation is enabled and the
+		// joint extrinsics path is active, allocate fixed-point int64 mirror
+		// buffers for d_Hpp_ (Phase 2) and d_bp_ (Phase 3a). The kernel routes
+		// ext-range atomicAdd writes into these buffers; the matching
+		// convertFixedPoint*ExtRange() helpers then propagate the ext slots
+		// back into the double buffers after each buildSystem(). Body-range
+		// slots remain zero and are never read back.
 		if (deterministicAccum_ && optimizeP_ && extJoint_ && numExt_ > 0)
 		{
 			d_Hpp_int_ext_.resize(static_cast<size_t>(d_Hpp_.elemSize()));
+			d_bp_int_ext_.resize(static_cast<size_t>(d_bp_.elemSize()));
 		}
 
 		if (optimizeL_)
@@ -776,29 +778,35 @@ public:
 				d_Hpl_.fillZero();
 			d_HscDirect_.fillZero();
 
-			// Option 4 Phase 2: deterministic Hpp[iPExt] accumulation. When the
-			// flag is on and the joint path has unfixed ext vertices, we zero
-			// the int64 mirror buffer, pass its raw pointer to the kernels, and
-			// after both 2D/3D accumulate calls we convert the ext-range slots
-			// back into d_Hpp_. When off, legacy double atomicAdd path is used
-			// and this whole block is a no-op (nullptr is passed to the kernel).
+			// Option 4 Phase 2+: deterministic Hpp[iPExt] (Phase 2) and
+			// bp[iPExt] (Phase 3a) accumulation. When the flag is on and the
+			// joint path has unfixed ext vertices, we zero both int64 mirror
+			// buffers, pass their raw pointers to the kernels, and after both
+			// 2D/3D accumulate calls we convert the ext-range slots back into
+			// d_Hpp_ / d_bp_. When off, the legacy double atomicAdd path is
+			// used and this whole block is a no-op (nullptr is passed to the
+			// kernel).
 			const bool useDetAccum = deterministicAccum_ && extJoint_ && numExt_ > 0;
 			long long* d_Hpp_int_ext_ptr = nullptr;
+			long long* d_bp_int_ext_ptr = nullptr;
 			if (useDetAccum)
 			{
 				d_Hpp_int_ext_.fillZero();
+				d_bp_int_ext_.fillZero();
 				d_Hpp_int_ext_ptr = d_Hpp_int_ext_.data();
+				d_bp_int_ext_ptr = d_bp_int_ext_.data();
 			}
 
 			gpu::constructQuadraticForm(d_Xcs2D_, d_qs_, d_cameras_, d_errors2D_, d_omegas2D_, d_edge2PL2D_,
-				d_edge2Hpl2D_, d_edge2HplExt2D_, d_edge2ExtIP2D_, d_edge2HscPE2D_, d_edgeFlags2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, kernels_[0], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_, d_Hpp_int_ext_ptr);
+				d_edge2Hpl2D_, d_edge2HplExt2D_, d_edge2ExtIP2D_, d_edge2HscPE2D_, d_edgeFlags2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, kernels_[0], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_, d_Hpp_int_ext_ptr, d_bp_int_ext_ptr);
 
 			gpu::constructQuadraticForm(d_Xcs3D_, d_qs_, d_cameras_, d_errors3D_, d_omegas3D_, d_edge2PL3D_,
-				d_edge2Hpl3D_, d_edge2HplExt3D_, d_edge2ExtIP3D_, d_edge2HscPE3D_, d_edgeFlags3D_, d_q_exts_3D_, d_t_exts_3D_, kernels_[1], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_, d_Hpp_int_ext_ptr);
+				d_edge2Hpl3D_, d_edge2HplExt3D_, d_edge2ExtIP3D_, d_edge2HscPE3D_, d_edgeFlags3D_, d_q_exts_3D_, d_t_exts_3D_, kernels_[1], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_, d_Hpp_int_ext_ptr, d_bp_int_ext_ptr);
 
 			if (useDetAccum)
 			{
 				gpu::convertFixedPointHppExtRange(d_Hpp_int_ext_ptr, d_Hpp_, numBody_, numExt_);
+				gpu::convertFixedPointBpExtRange(d_bp_int_ext_ptr, d_bp_, numBody_, numExt_);
 			}
 
 		const auto t1 = get_time_point();
@@ -1137,6 +1145,11 @@ private:
 	GpuVec3i d_HplBlockPos_;
 	GpuVec1d d_b_;
 	GpuPx1BlockVec d_bp_;
+	// Option 4 Phase 3a: fixed-point int64 mirror of d_bp_.values() used for
+	// deterministic atomicAdd on the joint ext gradient vector. Allocated only
+	// when deterministicAccum_ && extJoint_ && numExt_>0. Size ==
+	// d_bp_.elemSize().
+	DeviceBuffer<long long> d_bp_int_ext_;
 	GpuLx1BlockVec d_bl_;
 	GpuPx1BlockVec d_HppBackup_;
 	GpuLx1BlockVec d_HllBackup_;
