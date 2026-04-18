@@ -20,6 +20,7 @@
 - `HplSparseBlockMatrix` がこの module の主要な構成要素になっている
 - `HschurSparseBlockMatrix` がこの module の主要な構成要素になっている
 - `resize` がこの module の主要な構成要素になっている
+- `HschurSparseBlockMatrix::constructFromVertices()` は、landmark ごとの active row 集合を `Hpl` と同じ unique な `iP` 集合として扱う。joint extrinsics では同じ extrinsics vertex が同じ landmark を複数 edge で参照するため、edge incidence をそのまま数えると `nmultiplies_` が過大になり、Schur metadata と `Hpl` の row-pair 列挙がずれる。
 
 ### 連携境界
 - `Eigen/Core` と連携しながら責務を完結させる

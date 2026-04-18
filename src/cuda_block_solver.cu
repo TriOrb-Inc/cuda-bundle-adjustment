@@ -1032,8 +1032,9 @@ __global__ void computeActiveErrorsKernel(int nedges, const Vec4d* qs, const Vec
 
 template <int MDIM, int RK_TYPE>
 __global__ void constructQuadraticFormKernel(int nedges, const Vec3d* Xcs, const Vec4d* qs, const Vec5d* cameras, const Vecxd<MDIM>* errors,
-	const Scalar* omegas, const Vec2i* edge2PL, const int* edge2Hpl, const uint8_t* flags, RobustKernelFunc<RK_TYPE> robustKernel,
-	PxPBlockPtr Hpp, Px1BlockPtr bp, LxLBlockPtr Hll, Lx1BlockPtr bl, PxLBlockPtr Hpl,
+	const Scalar* omegas, const Vec2i* edge2PL, const int* edge2Hpl, const int* edge2HplExt, const int* edge2ExtIP, const int* edge2HscPE,
+	const uint8_t* flags, RobustKernelFunc<RK_TYPE> robustKernel,
+	PxPBlockPtr Hpp, Px1BlockPtr bp, LxLBlockPtr Hll, Lx1BlockPtr bl, PxLBlockPtr Hpl, PxPBlockPtr HscDirect,
 	const Vec4d* q_exts, const Vec3d* t_exts, const Vec4d* distortions)
 {
 	using Vecmd = Vecxd<MDIM>;
@@ -1109,10 +1110,142 @@ __global__ void constructQuadraticFormKernel(int nedges, const Vec3d* Xcs, const
 		// bl += = JLT*Omega*r
 		MatTMulVec<LDIM, MDIM, ACCUM_ATOMIC>(JL, error.data, bl.at(iL), omega);
 	}
-	if (!flag)
+	if (!(flag & (EDGE_FLAG_FIXED_P | EDGE_FLAG_FIXED_L)))
 	{
-		// Hpl += = JPT*Omega*JL
+		// Hpl += = JPT*Omega*JL (body). Unique per edge, ASSIGN is safe.
 		MatTMulMat<PDIM, MDIM, LDIM, ASSIGN>(JP, JL, Hpl.at(edge2Hpl[iE]), omega);
+	}
+
+	// Joint ext contribution. JE has the same shape as JP_body but is anchored
+	// on the ext vertex. JE = [Jpe · (-[Xc×]), Jpe] where Xc is the point in
+	// the camera-optical frame (post-extrinsics). The existing
+	// computeJacobiansExact*() kernels already produce Jpe internally; recompute
+	// here using Xc directly. JE drops Rb from the chain because the ext Jacobian
+	// is w.r.t. perturbation of camera_from_body, not body_from_world.
+		if (!(flag & EDGE_FLAG_FIXED_E))
+		{
+			const int iPExt = edge2ExtIP[iE];
+			const int hplExtSlot = edge2HplExt[iE];
+			const int hscPESlot = edge2HscPE[iE];
+
+		// Recompute Jpe locally. We need the camera-frame projection Jacobian
+		// J_pi (2x3 or 3x3) multiplied by R_ext (3x3). The same quantities are
+		// derived inside computeJacobiansExact, but we recompute them here to
+		// keep the ext path self-contained and avoid changing the existing
+		// Jacobian kernels' return signature.
+		Scalar JE[MDIM * PDIM];
+
+		// Build Jpi based on projection model.
+		Scalar Jpi[MDIM * 3];
+		const Scalar X = Xc[0];
+		const Scalar Y = Xc[1];
+		const Scalar Z = Xc[2];
+		const Scalar fu = camera.data[0];
+		const Scalar fv = camera.data[1];
+		const Scalar bf = camera.data[4];
+		bool use_equi = false;
+		const Scalar* dist_ptr = nullptr;
+		if (MDIM == 2 && distortions != nullptr)
+		{
+			dist_ptr = distortions[iE].data;
+			use_equi = (dist_ptr[0] != 0 || dist_ptr[1] != 0 || dist_ptr[2] != 0 || dist_ptr[3] != 0);
+		}
+
+		if (MDIM == 2 && use_equi)
+		{
+			// Equidistant Jpi (negated to match convention downstream).
+			const Scalar r = sqrt(X * X + Y * Y);
+			const Scalar eps = Scalar(1e-10);
+			if (r < eps)
+			{
+				const Scalar invZ = 1 / Z;
+				const Scalar invZZ = invZ * invZ;
+				Jpi[0 * 3 + 0] = -fu * invZ;  Jpi[0 * 3 + 1] = 0;          Jpi[0 * 3 + 2] = fu * X * invZZ;
+				Jpi[1 * 3 + 0] = 0;           Jpi[1 * 3 + 1] = -fv * invZ;  Jpi[1 * 3 + 2] = fv * Y * invZZ;
+			}
+			else
+			{
+				const Scalar r2 = r * r;
+				const Scalar r2_plus_Z2 = r2 + Z * Z;
+				const Scalar theta = atan2(r, Z);
+				const Scalar k1 = dist_ptr[0];
+				const Scalar k2 = dist_ptr[1];
+				const Scalar k3 = dist_ptr[2];
+				const Scalar k4 = dist_ptr[3];
+				const Scalar theta2 = theta * theta;
+				const Scalar theta3 = theta2 * theta;
+				const Scalar theta4 = theta2 * theta2;
+				const Scalar theta5 = theta4 * theta;
+				const Scalar theta6 = theta4 * theta2;
+				const Scalar theta7 = theta6 * theta;
+				const Scalar theta8 = theta4 * theta4;
+				const Scalar theta9 = theta8 * theta;
+				const Scalar theta_d = theta + k1 * theta3 + k2 * theta5 + k3 * theta7 + k4 * theta9;
+				const Scalar dtheta_d_dtheta = 1 + 3 * k1 * theta2 + 5 * k2 * theta4
+					+ 7 * k3 * theta6 + 9 * k4 * theta8;
+				const Scalar dtheta_dX = X * Z / (r * r2_plus_Z2);
+				const Scalar dtheta_dY = Y * Z / (r * r2_plus_Z2);
+				const Scalar dtheta_dZ = -r / r2_plus_Z2;
+				const Scalar dthetad_dX = dtheta_d_dtheta * dtheta_dX;
+				const Scalar dthetad_dY = dtheta_d_dtheta * dtheta_dY;
+				const Scalar dthetad_dZ = dtheta_d_dtheta * dtheta_dZ;
+				const Scalar inv_r2 = 1 / r2;
+				const Scalar ds_dX = (dthetad_dX * r - theta_d * (X / r)) * inv_r2;
+				const Scalar ds_dY = (dthetad_dY * r - theta_d * (Y / r)) * inv_r2;
+				const Scalar ds_dZ = dthetad_dZ / r;
+				const Scalar s = theta_d / r;
+				Jpi[0 * 3 + 0] = -(fu * (s + X * ds_dX));
+				Jpi[0 * 3 + 1] = -(fu * X * ds_dY);
+				Jpi[0 * 3 + 2] = -(fu * X * ds_dZ);
+				Jpi[1 * 3 + 0] = -(fv * Y * ds_dX);
+				Jpi[1 * 3 + 1] = -(fv * (s + Y * ds_dY));
+				Jpi[1 * 3 + 2] = -(fv * Y * ds_dZ);
+			}
+		}
+		else if (MDIM == 2)
+		{
+			const Scalar invZ = 1 / Z;
+			const Scalar invZZ = invZ * invZ;
+			Jpi[0 * 3 + 0] = -fu * invZ;  Jpi[0 * 3 + 1] = 0;          Jpi[0 * 3 + 2] = fu * X * invZZ;
+			Jpi[1 * 3 + 0] = 0;           Jpi[1 * 3 + 1] = -fv * invZ;  Jpi[1 * 3 + 2] = fv * Y * invZZ;
+		}
+		else  // MDIM == 3: pinhole stereo
+		{
+			const Scalar invZ = 1 / Z;
+			const Scalar invZZ = invZ * invZ;
+			Jpi[0 * 3 + 0] = -fu * invZ;  Jpi[0 * 3 + 1] = 0;          Jpi[0 * 3 + 2] = fu * X * invZZ;
+			Jpi[1 * 3 + 0] = 0;           Jpi[1 * 3 + 1] = -fv * invZ;  Jpi[1 * 3 + 2] = fv * Y * invZZ;
+			Jpi[2 * 3 + 0] = -fu * invZ;  Jpi[2 * 3 + 1] = 0;          Jpi[2 * 3 + 2] = (fu * X + bf) * invZZ;
+		}
+
+		// JE rotation columns [0:3]: Jpi * (-[Xc×])  (Xc in camera-optical frame)
+		// Note: unlike the body JP, here the cross is taken w.r.t. Xc (post-extrinsics)
+		// because the ext perturbation acts directly on camera_from_body.
+		MatView<Scalar, MDIM, PDIM> JEview(JE);
+		for (int r = 0; r < MDIM; r++)
+		{
+			JEview(r, 0) = Jpi[r * 3 + 1] * (-Z) + Jpi[r * 3 + 2] * Y;
+			JEview(r, 1) = Jpi[r * 3 + 0] * Z + Jpi[r * 3 + 2] * (-X);
+			JEview(r, 2) = Jpi[r * 3 + 0] * (-Y) + Jpi[r * 3 + 1] * X;
+			JEview(r, 3) = Jpi[r * 3 + 0];
+			JEview(r, 4) = Jpi[r * 3 + 1];
+			JEview(r, 5) = Jpi[r * 3 + 2];
+		}
+
+			if (iPExt >= 0)
+			{
+				MatTMulMat<PDIM, MDIM, PDIM, ACCUM_ATOMIC>(JE, JE, Hpp.at(iPExt), omega);
+				MatTMulVec<PDIM, MDIM, ACCUM_ATOMIC>(JE, error.data, bp.at(iPExt), omega);
+			}
+			if (!(flag & EDGE_FLAG_FIXED_P) && hscPESlot >= 0)
+			{
+				MatTMulMat<PDIM, MDIM, PDIM, ACCUM_ATOMIC>(JP, JE, HscDirect.at(hscPESlot), omega);
+			}
+			if (hplExtSlot >= 0 && !(flag & EDGE_FLAG_FIXED_L))
+			{
+				// Multiple edges may share the same (iP_ext, iL) Hpl slot; atomic accumulate.
+				MatTMulMat<PDIM, MDIM, LDIM, ACCUM_ATOMIC>(JE, JL, Hpl.at(hplExtSlot), omega);
+			}
 	}
 }
 
@@ -1265,6 +1398,10 @@ __global__ void computeHschureKernel(int size, const Vec3i* mulBlockIds,
 		return;
 
 	const Vec3i index = mulBlockIds[tid];
+	// Sentinel set by findHschureMulBlockIndicesKernel when the Hpl (iP1, iP2)
+	// pair does not have a corresponding Hschur entry (joint-ext structural mismatch).
+	if (index[2] < 0)
+		return;
 	Scalar A[PDIM * LDIM];
 	Scalar B[PDIM * LDIM];
 	copy<PDIM * LDIM>(Hpl_invHll.at(index[0]), A);
@@ -1284,13 +1421,29 @@ __global__ void findHschureMulBlockIndicesKernel(int cols, const int* HplColPtr,
 	for (int i = i0; i < i1; i++)
 	{
 		const int iP1 = HplRowInd[i];
+		const int kRowEnd = HscRowPtr[iP1 + 1];
 		int k = HscRowPtr[iP1];
 		for (int j = i; j < i1; j++)
 		{
 			const int iP2 = HplRowInd[j];
-			while (HscColInd[k] < iP2) k++;
-			const int pos = atomicAdd(nindices, 1);
-			mulBlockIds[pos] = makeVec3i(i, j, k);
+			// Bounded walk: stop at the row boundary to prevent reading into the
+			// next row's column data (cudaErrorInvalidAddressSpace in joint-ext
+			// mode when Hpl gains ext iP rows whose Hschur entries are not strict
+			// supersets of body cross-blocks on every landmark column).
+			while (k < kRowEnd && HscColInd[k] < iP2) k++;
+			if (k >= kRowEnd || HscColInd[k] != iP2)
+			{
+				// No matching Hschur entry. Emit a sentinel index so downstream
+				// computeHschureKernel can skip this multiplication instead of
+				// scattering into an unrelated block.
+				const int pos = atomicAdd(nindices, 1);
+				mulBlockIds[pos] = makeVec3i(i, j, -1);
+			}
+			else
+			{
+				const int pos = atomicAdd(nindices, 1);
+				mulBlockIds[pos] = makeVec3i(i, j, k);
+			}
 		}
 	}
 }
@@ -1348,6 +1501,96 @@ __global__ void updatePosesKernel(int size, Px1BlockPtr xp, Vec4d* qs, Vec3d* ts
 	Vec3d expt;
 	updateExp(xp.at(i), expq, expt);
 	updatePose(expq, expt, qs[i], ts[i]);
+}
+
+// Joint-mode variant with per-slot clamping for ext vertices (i >= num_body).
+// Reads the 6D delta from xp, clamps rotation/translation separately to the
+// given bounds, and then retracts onto SE(3) using the existing updateExp /
+// updatePose primitives. Body slots (i < num_body) take the unclamped path.
+__global__ void updatePosesKernelJoint(int size, int num_body, Scalar max_trans, Scalar max_rot,
+	Px1BlockPtr xp, Vec4d* qs, Vec3d* ts)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= size)
+		return;
+
+	Scalar delta[6];
+	const Scalar* xpi = xp.at(i);
+	for (int k = 0; k < 6; k++) delta[k] = xpi[k];
+
+	if (i >= num_body)
+	{
+		// Rotation in first 3, translation in last 3 (matches updateExp layout).
+		const Scalar rn = sqrt(delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]);
+		if (rn > max_rot && rn > 0)
+		{
+			const Scalar s = max_rot / rn;
+			delta[0] *= s; delta[1] *= s; delta[2] *= s;
+		}
+		const Scalar tn = sqrt(delta[3] * delta[3] + delta[4] * delta[4] + delta[5] * delta[5]);
+		if (tn > max_trans && tn > 0)
+		{
+			const Scalar s = max_trans / tn;
+			delta[3] *= s; delta[4] *= s; delta[5] *= s;
+		}
+	}
+
+	Vec4d expq;
+	Vec3d expt;
+	updateExp(delta, expq, expt);
+	updatePose(expq, expt, qs[i], ts[i]);
+}
+
+// Joint-mode: add prior diagonal to Hpp[iP] for iP in [num_body, num_body + num_ext).
+// Rotation DOFs [0..3) get lambda_rot, translation DOFs [3..6) get lambda_trans.
+__global__ void addExtPriorKernel(int num_ext, int num_body, Scalar lambda_rot, Scalar lambda_trans,
+	PxPBlockPtr Hpp)
+{
+	const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	const int total = num_ext * PDIM;
+	if (tid >= total)
+		return;
+	const int localIdx = tid / PDIM;
+	const int dof = tid % PDIM;
+	const int iP = num_body + localIdx;
+	const Scalar lambda = (dof < 3) ? lambda_rot : lambda_trans;
+	Scalar* block = Hpp.at(iP);
+	block[dof * PDIM + dof] += lambda;
+}
+
+// Joint-mode: build per-edge ext Hpl slot by dereferencing the dedup slot ids.
+//   out[iE] = (dedup[iE] < 0) ? -1 : edge2Hpl[nedges + dedup[iE]]
+// Default OFF / no ext dedup slots: caller invokes fillEdge2HplExtSentinel instead.
+__global__ void buildEdgeExtHplKernel(int nedges, int nedges_total, const int* dedup_slot_per_edge,
+	const int* edge2Hpl, int* edge2HplExt)
+{
+	const int iE = blockIdx.x * blockDim.x + threadIdx.x;
+	if (iE >= nedges)
+		return;
+	const int slot = dedup_slot_per_edge[iE];
+	edge2HplExt[iE] = (slot < 0) ? -1 : edge2Hpl[nedges_total + slot];
+}
+
+__global__ void fillIntSentinelKernel(int n, int sentinel, int* data)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n)
+		return;
+	data[i] = sentinel;
+}
+
+// Scatter current ext solution (qs[iPExt] / ts[iPExt]) into per-edge q_exts / t_exts
+// for edges whose extrinsics vertex participates in the joint solve.
+// Edges with edge2ExtIP[iE] < 0 retain their existing q_exts/t_exts (set once at init).
+__global__ void syncExtSolutionToPerEdgeKernel(int nedges, const Vec4d* qs, const Vec3d* ts,
+	const int* edge2ExtIP, Vec4d* q_exts, Vec3d* t_exts)
+{
+	const int iE = blockIdx.x * blockDim.x + threadIdx.x;
+	if (iE >= nedges) return;
+	const int iPExt = edge2ExtIP[iE];
+	if (iPExt < 0) return;
+	q_exts[iE] = qs[iPExt];
+	t_exts[iE] = ts[iPExt];
 }
 
 __global__ void updateLandmarksKernel(int size, Lx1BlockPtr xl, Vec3d* Xws)
@@ -1481,6 +1724,18 @@ void findHschureMulBlockIndices(const GpuHplBlockMat& Hpl, const GpuHscBlockMat&
 	DeviceBuffer<int> nindices(1);
 	nindices.fillZero();
 
+	// Initialize every Vec3i slot to (-1, -1, -1) before the kernel populates a
+	// prefix of the buffer via atomicAdd(nindices, 1). The buffer is sized for
+	// the upper bound nmultiplies_ (including duplicate enumeration of indices in
+	// constructFromVertices), but the kernel only writes one slot per unique Hpl
+	// (iP1, iP2) pair for each landmark column, which is <= nmultiplies_. Joint
+	// ext mode makes this gap real: computeHschureKernel would otherwise scatter
+	// into random Hschur/Hpl blocks for the tail entries. Writing 0xFF bytes
+	// across the entire buffer sets each int to -1, which the sentinel check in
+	// computeHschureKernel (index[2] < 0) skips.
+	CUDA_CHECK(cudaMemset(mulBlockIds.data(), 0xFF,
+		sizeof(Vec3i) * mulBlockIds.size()));
+
 	findHschureMulBlockIndicesKernel<<<grid, block>>>(Hpl.cols(), Hpl.outerIndices(), Hpl.innerIndices(),
 		Hsc.outerIndices(), Hsc.innerIndices(), mulBlockIds, nindices);
 	CUDA_CHECK(cudaGetLastError());
@@ -1561,10 +1816,12 @@ Scalar computeActiveErrors(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5
 
 template <int MDIM, int RK_TYPE = 0>
 void constructQuadraticForm_(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVec5d& cameras, const GpuVecAny& _errors,
-	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1b& flags,
+	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1i& edge2HplExt,
+	const GpuVec1i& edge2ExtIP, const GpuVec1i& edge2HscPE, const GpuVec1b& flags,
 	const GpuVec4d& q_exts, const GpuVec3d& t_exts, const GpuVec4d& distortions,
 	Scalar robustDelta,
-	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuHplBlockMat& Hpl)
+	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuHplBlockMat& Hpl,
+	GpuHscBlockMat& HscDirect)
 {
 	const auto& errors = _errors.getRef<Vecxd<MDIM>>();
 	const RobustKernelFunc<RK_TYPE> robustKernel(robustDelta);
@@ -1581,15 +1838,15 @@ void constructQuadraticForm_(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuV
 		? static_cast<const Vec4d*>(distortions) : nullptr;
 
 	constructQuadraticFormKernel<MDIM, RK_TYPE><<<grid, block>>>(nedges, Xcs, qs, cameras, errors, omegas,
-		edge2PL, edge2Hpl, flags, robustKernel, Hpp, bp, Hll, bl, Hpl,
+		edge2PL, edge2Hpl, edge2HplExt, edge2ExtIP, edge2HscPE, flags, robustKernel, Hpp, bp, Hll, bl, Hpl, HscDirect,
 		q_exts, t_exts, d_dist_ptr);
 	CUDA_CHECK(cudaGetLastError());
 }
 
 using ConstructQuadraticFormFunc = void(*)(const GpuVec3d&, const GpuVec4d&, const GpuVec5d&, const GpuVecAny&,
-	const GpuVec1d&, const GpuVec2i&, const GpuVec1i&, const GpuVec1b&,
+	const GpuVec1d&, const GpuVec2i&, const GpuVec1i&, const GpuVec1i&, const GpuVec1i&, const GpuVec1i&, const GpuVec1b&,
 	const GpuVec4d&, const GpuVec3d&, const GpuVec4d&, Scalar,
-	GpuPxPBlockVec&, GpuPx1BlockVec&, GpuLxLBlockVec&, GpuLx1BlockVec&, GpuHplBlockMat&);
+	GpuPxPBlockVec&, GpuPx1BlockVec&, GpuLxLBlockVec&, GpuLx1BlockVec&, GpuHplBlockMat&, GpuHscBlockMat&);
 
 static ConstructQuadraticFormFunc constructQuadraticFormFuncs[6] =
 {
@@ -1602,25 +1859,29 @@ static ConstructQuadraticFormFunc constructQuadraticFormFuncs[6] =
 };
 
 void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVec5d& cameras, const GpuVec2d& errors,
-	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1b& flags,
+	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1i& edge2HplExt,
+	const GpuVec1i& edge2ExtIP, const GpuVec1i& edge2HscPE, const GpuVec1b& flags,
 	const GpuVec4d& q_exts, const GpuVec3d& t_exts, const GpuVec4d& distortions,
 	const RobustKernel& kernel,
-	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuHplBlockMat& Hpl)
+	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuHplBlockMat& Hpl,
+	GpuHscBlockMat& HscDirect)
 {
 	auto func = constructQuadraticFormFuncs[0 + kernel.type];
-	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, flags, q_exts, t_exts, distortions, kernel.delta, Hpp, bp, Hll, bl, Hpl);
+	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, edge2HplExt, edge2ExtIP, edge2HscPE, flags, q_exts, t_exts, distortions, kernel.delta, Hpp, bp, Hll, bl, Hpl, HscDirect);
 }
 
 void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVec5d& cameras, const GpuVec3d& errors,
-	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1b& flags,
+	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1i& edge2HplExt,
+	const GpuVec1i& edge2ExtIP, const GpuVec1i& edge2HscPE, const GpuVec1b& flags,
 	const GpuVec4d& q_exts, const GpuVec3d& t_exts,
 	const RobustKernel& kernel,
-	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuHplBlockMat& Hpl)
+	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuHplBlockMat& Hpl,
+	GpuHscBlockMat& HscDirect)
 {
 	// 3D (stereo) path: no distortion support, pass empty GpuVec4d
 	static GpuVec4d empty_distortions;
 	auto func = constructQuadraticFormFuncs[3 + kernel.type];
-	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, flags, q_exts, t_exts, empty_distortions, kernel.delta, Hpp, bp, Hll, bl, Hpl);
+	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, edge2HplExt, edge2ExtIP, edge2HscPE, flags, q_exts, t_exts, empty_distortions, kernel.delta, Hpp, bp, Hll, bl, Hpl, HscDirect);
 }
 
 template <int MDIM>
@@ -1758,7 +2019,7 @@ void computeBschure(const GpuPx1BlockVec& bp, const GpuHplBlockMat& Hpl, const G
 	CUDA_CHECK(cudaGetLastError());
 }
 
-void computeHschure(const GpuPxPBlockVec& Hpp, const GpuPxLBlockVec& Hpl_invHll,
+void computeHschure(const GpuPxPBlockVec& Hpp, const GpuHscBlockMat& HscDirect, const GpuPxLBlockVec& Hpl_invHll,
 	const GpuHplBlockMat& Hpl, const GpuVec3i& mulBlockIds, GpuHscBlockMat& Hsc)
 {
 	prepareCudaThreadContext();
@@ -1767,7 +2028,9 @@ void computeHschure(const GpuPxPBlockVec& Hpp, const GpuPxLBlockVec& Hpl_invHll,
 	const int grid1 = divUp(Hsc.rows(), block);
 	const int grid2 = divUp(nmulBlocks, block);
 
-	Hsc.fillZero();
+	CUDA_CHECK(cudaMemcpy(Hsc.values(), HscDirect.values(),
+		sizeof(Scalar) * Hsc.nnz() * GpuHscBlockMat::BLOCK_AREA,
+		cudaMemcpyDeviceToDevice));
 	initializeHschurKernel<<<grid1, block>>>(Hsc.rows(), Hpp, Hsc, Hsc.outerIndices());
 	computeHschureKernel<<<grid2, block>>>(nmulBlocks, mulBlockIds, Hpl_invHll, Hpl, Hsc);
 	CUDA_CHECK(cudaGetLastError());
@@ -1822,6 +2085,77 @@ void updatePoses(const GpuPx1BlockVec& xp, GpuVec4d& qs, GpuVec3d& ts)
 	const int block = 256;
 	const int grid = divUp(xp.size(), block);
 	updatePosesKernel<<<grid, block>>>(xp.size(), xp, qs, ts);
+	CUDA_CHECK(cudaGetLastError());
+}
+
+void updatePoses(const GpuPx1BlockVec& xp, GpuVec4d& qs, GpuVec3d& ts, int num_body,
+	Scalar max_ext_trans, Scalar max_ext_rot)
+{
+	if (!xp.size())
+		return;
+
+	const int block = 256;
+	const int grid = divUp(xp.size(), block);
+	updatePosesKernelJoint<<<grid, block>>>(xp.size(), num_body, max_ext_trans, max_ext_rot, xp, qs, ts);
+	CUDA_CHECK(cudaGetLastError());
+}
+
+void addExtPrior(GpuPxPBlockVec& Hpp, int numBody, int numExt, Scalar lambda_rot, Scalar lambda_trans)
+{
+	if (numExt <= 0)
+		return;
+	prepareCudaThreadContext();
+	const int total = numExt * PDIM;
+	const int block = 256;
+	const int grid = divUp(total, block);
+	addExtPriorKernel<<<grid, block>>>(numExt, numBody, lambda_rot, lambda_trans, Hpp);
+	CUDA_CHECK(cudaGetLastError());
+}
+
+void buildEdgeExtHpl(const int* h_dedup_slot_per_edge, int nedges_total, int nExtDedupSlots,
+	const GpuVec1i& edge2Hpl, GpuVec1i& edge2HplExt)
+{
+	if (nedges_total <= 0)
+		return;
+	prepareCudaThreadContext();
+
+	// Upload dedup_slot per edge to a device buffer local to this call.
+	GpuVec1i d_dedup;
+	d_dedup.assign(static_cast<size_t>(nedges_total), h_dedup_slot_per_edge);
+
+	const int block = 256;
+	const int grid = divUp(nedges_total, block);
+	buildEdgeExtHplKernel<<<grid, block>>>(nedges_total, nedges_total, d_dedup.data(), edge2Hpl.data(), edge2HplExt.data());
+	CUDA_CHECK(cudaGetLastError());
+	// Wait for kernel completion before d_dedup is destroyed when this function returns,
+	// otherwise the kernel may read freed device memory.
+	CUDA_CHECK(cudaDeviceSynchronize());
+	// Suppress unused-parameter warning for nExtDedupSlots; retained in the
+	// public signature for potential sanity checks at a later revision.
+	(void)nExtDedupSlots;
+}
+
+void fillEdge2HplExtSentinel(GpuVec1i& edge2HplExt, int nedges_total)
+{
+	if (nedges_total <= 0)
+		return;
+	prepareCudaThreadContext();
+	const int block = 256;
+	const int grid = divUp(nedges_total, block);
+	fillIntSentinelKernel<<<grid, block>>>(nedges_total, -1, edge2HplExt.data());
+	CUDA_CHECK(cudaGetLastError());
+}
+
+void syncExtSolutionToPerEdge(const GpuVec4d& qs, const GpuVec3d& ts,
+	const GpuVec1i& edge2ExtIP, GpuVec4d& q_exts, GpuVec3d& t_exts, int nedges)
+{
+	if (nedges <= 0)
+		return;
+	prepareCudaThreadContext();
+	const int block = 256;
+	const int grid = divUp(nedges, block);
+	syncExtSolutionToPerEdgeKernel<<<grid, block>>>(nedges, qs.data(), ts.data(),
+		edge2ExtIP.data(), q_exts.data(), t_exts.data());
 	CUDA_CHECK(cudaGetLastError());
 }
 

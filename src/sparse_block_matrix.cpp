@@ -77,9 +77,20 @@ void HschurSparseBlockMatrix::constructFromVertices(const std::vector<VertexL*>&
 			const auto vP = e->poseVertex();
 			if (!vP->fixed)
 				indices.push_back(vP->iP);
+			// Joint ext mode: each edge's ext vertex (if unfixed) also contributes
+			// a row/col in Hschur so body-ext and ext-ext cross blocks are allocated.
+			// The legacy path (extrinsicsVertex returns nullptr or vE->fixed==true)
+			// naturally skips this branch and keeps byte-identical behavior.
+			const auto vE = e->extrinsicsVertex();
+			if (vE != nullptr && !vE->fixed && vE->iP >= 0)
+				indices.push_back(vE->iP);
 		}
 
 		std::sort(std::begin(indices), std::end(indices));
+		// Hpl uses one row per unique (iP, landmark) pair. Keep Hschur on the
+		// same deduplicated row set so nmultiplies_ matches the actual row-pair
+		// enumeration used by findHschureMulBlockIndices.
+		indices.erase(std::unique(std::begin(indices), std::end(indices)), std::end(indices));
 		const int nindices = static_cast<int>(indices.size());
 		for (int i = 0; i < nindices; i++)
 		{

@@ -52,9 +52,28 @@ void trace_cuda_ba(const std::string& message)
 	std::cerr << "[cuda_ba] " << message << std::endl;
 }
 
+// Joint-solve extrinsics (Option A). Default OFF: extrinsics are treated as
+// fixed per-edge constants and routed through q_exts_/t_exts_ exactly as in
+// the P1.1 scaffold. When TRIORB_OPTIMIZE_EXTRINSICS_JOINT=1, any unfixed
+// extrinsics vertex is appended to verticesP_ after body poses and jointly
+// optimized via its own Jacobian contribution.
+bool is_joint_ext_optimization_enabled()
+{
+	const char* env_value = std::getenv("TRIORB_OPTIMIZE_EXTRINSICS_JOINT");
+	return env_value != nullptr && std::string(env_value) == "1";
+}
+
 } // namespace
 
 static constexpr int EDGE_TYPE_NUM = static_cast<int>(EdgeType::COUNT);
+
+// Joint-mode ext optimization parameters. Prior lambdas are deliberately large
+// so the ext degrees of freedom barely move unless strong evidence accumulates.
+// Clamp bounds match the CPU-side decoupled solver for parity.
+static constexpr double kExtPriorLambdaRot = 1.0e8;
+static constexpr double kExtPriorLambdaTrans = 1.0e8;
+static constexpr double kExtMaxTranslationPerIter = 0.0005;      // 0.5 mm
+static constexpr double kExtMaxRotationPerIter = 0.0017453292519943296;  // 0.1 deg in rad
 
 using VertexMapP = std::map<int, VertexP*>;
 using VertexMapL = std::map<int, VertexL*>;
@@ -136,9 +155,18 @@ public:
 
 		numP_ = numL_ = nedges2D_ = nedges3D_ = nHplBlocks_ = 0;
 		optimizeP_ = optimizeL_ = false;
+
+		// Joint ext optimization bookkeeping (Option A).
+		numBody_ = 0;
+		numExt_ = 0;
+		extJoint_ = false;
+		edge2ExtIP_.clear();
+		edge_to_ext_dedup_slot_.clear();
+		nExtHplBlocks_ = 0;
 	}
 
 	void initialize(const VertexMapP& vertexMapP, const VertexMapL& vertexMapL,
+		const VertexMapE& vertexMapE,
 		const EdgeSet2D& edgeSet2D, const EdgeSet3D& edgeSet3D, const RobustKernel kernels[])
 	{
 		trace_cuda_ba(
@@ -213,6 +241,57 @@ public:
 			}
 		}
 
+		numBody_ = numP;
+		extJoint_ = is_joint_ext_optimization_enabled();
+		verticesEJoint_.clear();
+
+		// Reset iP on every ext vertex so subsequent kernels can quickly detect
+		// whether a vertex is currently participating in the joint solve.
+		for (const auto& [id, vertexE] : vertexMapE)
+		{
+			if (vertexE != nullptr) vertexE->iP = -1;
+		}
+
+		// In joint mode, append unfixed extrinsics vertices immediately after the
+		// active body poses. Their iP lives in [numBody_, numBody_+numExt). They
+		// share qs_/ts_/cameras_ layout with body poses so existing device sizing
+		// logic applies unchanged, but are tracked separately in verticesEJoint_
+		// for write-back (finalize writes them back to ExtrinsicsVertex::q/t).
+		int numExt = 0;
+		if (extJoint_)
+		{
+			for (const auto& [id, vertexE] : vertexMapE)
+			{
+				if (vertexE == nullptr) continue;
+				if (vertexE->fixed) continue;
+				if (vertexE->edges.empty()) continue;
+				// Require at least one connected edge with a non-fixed landmark so
+				// the ext iP participates in the Schur complement structure
+				// (constructFromVertices only enumerates landmark-shared cross blocks).
+				bool hasUnfixedLandmarkEdge = false;
+				for (const auto e : vertexE->edges)
+				{
+					if (e->landmarkVertex() != nullptr && !e->landmarkVertex()->fixed)
+					{
+						hasUnfixedLandmarkEdge = true;
+						break;
+					}
+				}
+				if (!hasUnfixedLandmarkEdge) continue;
+
+				vertexE->iP = numP++;
+				verticesEJoint_.push_back(vertexE);
+				qs_.emplace_back(vertexE->q.coeffs().data());
+				ts_.emplace_back(vertexE->t.data());
+				// Dummy camera slot for ext pose; kernels never dereference cameras[iP_ext].
+				Vec5d dummyCam;
+				dummyCam[0] = 0; dummyCam[1] = 0; dummyCam[2] = 0; dummyCam[3] = 0; dummyCam[4] = 0;
+				cameras_.emplace_back(dummyCam);
+				numExt++;
+			}
+		}
+		numExt_ = numExt;
+
 		numP_ = numP;
 		numL_ = numL;
 		optimizeP_ = numP_ > 0;
@@ -235,6 +314,12 @@ public:
 			Xws_.emplace_back(vertexL->Xw.data());
 		}
 
+		// Dedup map for ext Hpl block structure. Multiple edges may share the same
+		// (iP_ext, iL) pair (same camera observing the same landmark from different
+		// keyframes); each dedup slot points to a single Hpl column entry so that
+		// multiple edges atomically accumulate into the same Hpl block.
+		std::map<std::pair<int,int>, int> ext_dedup_map;
+
 		// gather each edge members into each vector
 		int edgeId = 0, nedges2D = 0, nedges3D = 0;
 		for (const auto e : edgeSet2D)
@@ -251,7 +336,7 @@ public:
 				measurements2D_.emplace_back(e->measurement.data());
 				omegas_.push_back(ScalarCast(e->information));
 				edge2PL_.push_back({ vertexP->iP, vertexL->iL });
-				edgeFlags_.push_back(makeEdgeFlag(vertexP->fixed, vertexL->fixed));
+				uint8_t flag = makeEdgeFlag(vertexP->fixed, vertexL->fixed);
 
 				// Per-edge extrinsics: prefer vertexE if present (P1.1 scaffold),
 				// else fall back to per-edge q_ext/t_ext.
@@ -273,6 +358,30 @@ public:
 					q_exts_.emplace_back(identity_q);
 					t_exts_.emplace_back(zero_t);
 				}
+
+				// Joint ext bookkeeping: record iP_ext and dedup Hpl slot when the
+				// connected extrinsics vertex participates in the joint solve.
+				// Default EDGE_FLAG_FIXED_E is set unless we establish an ext slot.
+				flag |= EDGE_FLAG_FIXED_E;
+					int iPExt = -1;
+					int extDedupSlot = -1;
+					if (extJoint_ && e->vertexE != nullptr && !e->vertexE->fixed && e->vertexE->iP >= 0)
+					{
+						iPExt = e->vertexE->iP;
+						flag &= static_cast<uint8_t>(~EDGE_FLAG_FIXED_E);
+						if (!vertexL->fixed)
+						{
+							const auto key = std::make_pair(iPExt, vertexL->iL);
+							auto [it, inserted] = ext_dedup_map.insert({ key, static_cast<int>(ext_dedup_map.size()) });
+							extDedupSlot = it->second;
+							if (inserted)
+								HplBlockPos_.push_back({ iPExt, vertexL->iL, -1 /* patched below */ });
+						}
+					}
+					edgeFlags_.push_back(flag);
+					edge2ExtIP_.push_back(iPExt);
+					edge2HscPE_.push_back(-1);
+					edge_to_ext_dedup_slot_.push_back(extDedupSlot);
 
 				// Per-edge distortion coefficients (Kannala-Brandt equidistant model).
 				{
@@ -308,7 +417,7 @@ public:
 				measurements3D_.emplace_back(e->measurement.data());
 				omegas_.push_back(ScalarCast(e->information));
 				edge2PL_.push_back({ vertexP->iP, vertexL->iL });
-				edgeFlags_.push_back(makeEdgeFlag(vertexP->fixed, vertexL->fixed));
+				uint8_t flag = makeEdgeFlag(vertexP->fixed, vertexL->fixed);
 
 				// Per-edge extrinsics: prefer vertexE if present, else fall back to q_ext/t_ext.
 				if (e->vertexE != nullptr)
@@ -329,8 +438,48 @@ public:
 					t_exts_.emplace_back(zero_t);
 				}
 
+				// Joint ext bookkeeping (same as 2D path).
+				flag |= EDGE_FLAG_FIXED_E;
+					int iPExt = -1;
+					int extDedupSlot = -1;
+					if (extJoint_ && e->vertexE != nullptr && !e->vertexE->fixed && e->vertexE->iP >= 0)
+					{
+						iPExt = e->vertexE->iP;
+						flag &= static_cast<uint8_t>(~EDGE_FLAG_FIXED_E);
+						if (!vertexL->fixed)
+						{
+							const auto key = std::make_pair(iPExt, vertexL->iL);
+							auto [it, inserted] = ext_dedup_map.insert({ key, static_cast<int>(ext_dedup_map.size()) });
+							extDedupSlot = it->second;
+							if (inserted)
+								HplBlockPos_.push_back({ iPExt, vertexL->iL, -1 });
+						}
+					}
+					edgeFlags_.push_back(flag);
+					edge2ExtIP_.push_back(iPExt);
+					edge2HscPE_.push_back(-1);
+					edge_to_ext_dedup_slot_.push_back(extDedupSlot);
+
 				edgeId++;
 				nedges3D++;
+			}
+		}
+
+		// Patch ext HplBlockPos ids and count dedup slots. Body entries reuse the
+		// edge-indexed id space [0, nedges); ext entries occupy [nedges, nedges + n_ext_dedup).
+		nExtHplBlocks_ = static_cast<int>(ext_dedup_map.size());
+		if (nExtHplBlocks_ > 0)
+		{
+			const int nedges_total = nedges2D + nedges3D;
+			std::vector<int> slot_seen(nExtHplBlocks_, 0);
+			int patch_cursor = 0;
+			for (auto& bp : HplBlockPos_)
+			{
+				if (bp.id >= 0) continue;  // body entry: already has valid edgeId
+				// Find the dedup slot this entry corresponds to by scanning the map.
+				// Order of push matches insertion order of ext_dedup_map.
+				bp.id = nedges_total + patch_cursor;
+				patch_cursor++;
 			}
 		}
 
@@ -398,18 +547,25 @@ public:
 
 			d_HplBlockPos_.assign(nHplBlocks_, HplBlockPos_.data());
 			d_nnzPerCol_.resize(numL_ + 1);
-			d_edge2Hpl_.resize(baseEdges_.size());
+			// indexPL now holds both body-edge slots [0, nedges) and ext dedup
+			// slots [nedges, nedges + nExtHplBlocks_).
+			const int nedges_total = static_cast<int>(baseEdges_.size());
+			d_edge2Hpl_.resize(nedges_total + nExtHplBlocks_);
 
 			gpu::buildHplStructure(d_HplBlockPos_, d_Hpl_, d_edge2Hpl_, d_nnzPerCol_);
 
-			// build Hschur block matrix structure
+			// build Hschur block matrix structure. Joint mode passes ext vertices
+			// so shared landmarks produce body-ext and ext-ext cross blocks.
 			Hsc_.resize(numP_, numP_);
 			Hsc_.constructFromVertices(verticesL_);
 			Hsc_.convertBSRToCSR();
 
-			d_Hsc_.resize(numP_, numP_);
-			d_Hsc_.resizeNonZeros(Hsc_.nblocks());
-			d_Hsc_.upload(nullptr, Hsc_.outerIndices(), Hsc_.innerIndices());
+				d_Hsc_.resize(numP_, numP_);
+				d_Hsc_.resizeNonZeros(Hsc_.nblocks());
+				d_Hsc_.upload(nullptr, Hsc_.outerIndices(), Hsc_.innerIndices());
+				d_HscDirect_.resize(numP_, numP_);
+				d_HscDirect_.resizeNonZeros(Hsc_.nblocks());
+				d_HscDirect_.upload(nullptr, Hsc_.outerIndices(), Hsc_.innerIndices());
 
 			d_HscCSR_.resize(Hsc_.nnzSymm());
 			d_BSR2CSR_.assign(Hsc_.nnzSymm(), (int*)Hsc_.BSR2CSR());
@@ -423,10 +579,74 @@ public:
 
 			d_edge2Hpl2D_.map(nedges2D_, d_edge2Hpl_.data());
 			d_edge2Hpl3D_.map(nedges3D_, d_edge2Hpl_.data() + nedges2D_);
-		}
+
+			// Joint-mode: compose d_edge2HplExt_ per edge by indexing
+			// d_edge2Hpl_[nedges_total + slot_id]. We resize a dedicated array even
+			// when nExt=0 so downstream kernel call signatures stay uniform.
+			d_edge2HplExt_.resize(nedges_total);
+			if (extJoint_ && nExtHplBlocks_ > 0)
+			{
+				gpu::buildEdgeExtHpl(edge_to_ext_dedup_slot_.data(),
+					nedges_total, nExtHplBlocks_, d_edge2Hpl_, d_edge2HplExt_);
+			}
+			else
+			{
+				gpu::fillEdge2HplExtSentinel(d_edge2HplExt_, nedges_total);
+			}
+			d_edge2HplExt2D_.map(nedges2D_, d_edge2HplExt_.data());
+			d_edge2HplExt3D_.map(nedges3D_, d_edge2HplExt_.data() + nedges2D_);
+
+			// Upload per-edge ext iP (needed by kernel to atomic-add into Hpp[iP_ext] / bp[iP_ext]).
+				if (!edge2ExtIP_.empty())
+				{
+					d_edge2ExtIP_.assign(static_cast<size_t>(nedges_total), edge2ExtIP_.data());
+				}
+				else
+			{
+				d_edge2ExtIP_.resize(nedges_total);
+				gpu::fillEdge2HplExtSentinel(d_edge2ExtIP_, nedges_total);
+				}
+				d_edge2ExtIP2D_.map(nedges2D_, d_edge2ExtIP_.data());
+				d_edge2ExtIP3D_.map(nedges3D_, d_edge2ExtIP_.data() + nedges2D_);
+
+				// Build per-edge direct Hsc(body, ext) block slot. Joint mode appends ext
+				// vertices after active body pose vertices, so body/ext cross terms always
+				// live in the upper-triangular Hsc structure at row=min(iP, iPExt), col=max(...).
+				edge2HscPE_.assign(static_cast<size_t>(nedges_total), -1);
+				if (extJoint_)
+				{
+					const int* hscOuter = Hsc_.outerIndices();
+					const int* hscInner = Hsc_.innerIndices();
+					for (int edge_idx = 0; edge_idx < nedges_total; ++edge_idx)
+					{
+						const int iPExt = edge2ExtIP_[edge_idx];
+						if (iPExt < 0)
+							continue;
+
+						const int iPBody = edge2PL_[edge_idx].P;
+						if (iPBody < 0 || iPBody == iPExt)
+							continue;
+
+						const int row = std::min(iPBody, iPExt);
+						const int col = std::max(iPBody, iPExt);
+						for (int hidx = hscOuter[row]; hidx < hscOuter[row + 1]; ++hidx)
+						{
+							if (hscInner[hidx] == col)
+							{
+								edge2HscPE_[edge_idx] = hidx;
+								break;
+							}
+						}
+					}
+				}
+				d_edge2HscPE_.assign(static_cast<size_t>(nedges_total), edge2HscPE_.data());
+				d_edge2HscPE2D_.map(nedges2D_, d_edge2HscPE_.data());
+				d_edge2HscPE3D_.map(nedges3D_, d_edge2HscPE_.data() + nedges2D_);
+			}
 
 		// upload solutions to device memory
-		d_solution_.resize(verticesP_.size() * 7 + verticesL_.size() * 3);
+		// Include joint-mode ext vertices: qs_/ts_ hold all slots (body active + ext + body fixed).
+		d_solution_.resize(qs_.size() * 7 + Xws_.size() * 3);
 		d_solutionBackup_.resize(d_solution_.size());
 
 		d_qs_.map(qs_.size(), d_solution_.data());
@@ -489,6 +709,10 @@ public:
 	{
 		const auto t0 = get_time_point();
 
+		// Joint mode: refresh per-edge q_exts/t_exts from the (potentially updated)
+		// qs_/ts_ slots so the projection kernel sees the current ext state.
+		syncExtSolutionToPerEdge();
+
 		const Scalar chi2D = gpu::computeActiveErrors(d_qs_, d_ts_, d_cameras_, d_Xws_, d_measurements2D_,
 			d_omegas2D_, d_edge2PL2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, kernels_[0], d_errors2D_, d_Xcs2D_, d_chi_);
 
@@ -499,6 +723,17 @@ public:
 		profItems_[PROF_ITEM_COMPUTE_ERROR] += get_duration(t0, t1);
 
 		return chi2D + chi3D;
+	}
+
+	// Joint mode: scatter the current ext solution (qs_/ts_ at iP in [numBody_, numBody_+numExt_))
+	// into the per-edge q_exts_/t_exts_ arrays that the error/Jacobian kernels read.
+	// No-op when joint mode is OFF (d_edge2ExtIP_ is all -1) and when numExt_==0.
+	void syncExtSolutionToPerEdge()
+	{
+		if (!extJoint_ || numExt_ == 0)
+			return;
+		gpu::syncExtSolutionToPerEdge(d_qs_, d_ts_, d_edge2ExtIP2D_, d_q_exts_2D_, d_t_exts_2D_, nedges2D_);
+		gpu::syncExtSolutionToPerEdge(d_qs_, d_ts_, d_edge2ExtIP3D_, d_q_exts_3D_, d_t_exts_3D_, nedges3D_);
 	}
 
 	void buildSystem()
@@ -516,17 +751,34 @@ public:
 
 		d_Hpp_.fillZero();
 		d_Hll_.fillZero();
-		d_bp_.fillZero();
-		d_bl_.fillZero();
+			d_bp_.fillZero();
+			d_bl_.fillZero();
+			// Joint mode: ext Hpl slots use ACCUM_ATOMIC (multiple edges may share a dedup slot).
+			// We zero the entire Hpl nnz region so ext slots start at 0; body slots are safely
+			// overwritten by ASSIGN on every edge so the zero has no effect on them.
+			if (extJoint_ && nExtHplBlocks_ > 0)
+				d_Hpl_.fillZero();
+			d_HscDirect_.fillZero();
 
-		gpu::constructQuadraticForm(d_Xcs2D_, d_qs_, d_cameras_, d_errors2D_, d_omegas2D_, d_edge2PL2D_,
-			d_edge2Hpl2D_, d_edgeFlags2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, kernels_[0], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_);
+			gpu::constructQuadraticForm(d_Xcs2D_, d_qs_, d_cameras_, d_errors2D_, d_omegas2D_, d_edge2PL2D_,
+				d_edge2Hpl2D_, d_edge2HplExt2D_, d_edge2ExtIP2D_, d_edge2HscPE2D_, d_edgeFlags2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, kernels_[0], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_);
 
-		gpu::constructQuadraticForm(d_Xcs3D_, d_qs_, d_cameras_, d_errors3D_, d_omegas3D_, d_edge2PL3D_,
-			d_edge2Hpl3D_, d_edgeFlags3D_, d_q_exts_3D_, d_t_exts_3D_, kernels_[1], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_);
+			gpu::constructQuadraticForm(d_Xcs3D_, d_qs_, d_cameras_, d_errors3D_, d_omegas3D_, d_edge2PL3D_,
+				d_edge2Hpl3D_, d_edge2HplExt3D_, d_edge2ExtIP3D_, d_edge2HscPE3D_, d_edgeFlags3D_, d_q_exts_3D_, d_t_exts_3D_, kernels_[1], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_);
 
 		const auto t1 = get_time_point();
 		profItems_[PROF_ITEM_BUILD_SYSTEM] += get_duration(t0, t1);
+	}
+
+	// Called from optimize() after maxDiagonal() so the prior doesn't skew
+	// the LM lambda seed. Runs every LM iteration (after each buildSystem).
+	void applyExtPriorIfEnabled()
+	{
+		if (extJoint_ && numExt_ > 0)
+		{
+			gpu::addExtPrior(d_Hpp_, numBody_, numExt_,
+				ScalarCast(kExtPriorLambdaRot), ScalarCast(kExtPriorLambdaTrans));
+		}
 	}
 
 	double maxDiagonal()
@@ -562,7 +814,7 @@ public:
 			// HSc = Hpp - Hpl*Hll^-1*HplT
 			////////////////////////////////////////////////////////////////////////////////////
 			gpu::computeBschure(d_bp_, d_Hpl_, d_Hll_, d_bl_, d_bsc_, d_invHll_, d_Hpl_invHll_);
-			gpu::computeHschure(d_Hpp_, d_Hpl_invHll_, d_Hpl_, d_HscMulBlockIds_, d_Hsc_);
+				gpu::computeHschure(d_Hpp_, d_HscDirect_, d_Hpl_invHll_, d_Hpl_, d_HscMulBlockIds_, d_Hsc_);
 			trace_cuda_ba("solve schur complement end");
 
 			const auto t1 = get_time_point();
@@ -612,7 +864,17 @@ public:
 	{
 		const auto t0 = get_time_point();
 
-		gpu::updatePoses(d_xp_, d_qs_, d_ts_);
+		if (extJoint_ && numExt_ > 0)
+		{
+			// Joint mode: body slots update normally; ext slots get per-iteration
+			// clamping inside the kernel.
+			gpu::updatePoses(d_xp_, d_qs_, d_ts_, numBody_,
+				ScalarCast(kExtMaxTranslationPerIter), ScalarCast(kExtMaxRotationPerIter));
+		}
+		else
+		{
+			gpu::updatePoses(d_xp_, d_qs_, d_ts_);
+		}
 		gpu::updateLandmarks(d_xl_, d_Xws_);
 
 		const auto t1 = get_time_point();
@@ -643,10 +905,35 @@ public:
 		d_ts_.download(ts_.data());
 		d_Xws_.download(Xws_.data());
 
-		for (size_t i = 0; i < verticesP_.size(); i++)
+		// Layout: qs_/ts_ = [active_body_poses | ext_joint_slots | fixed_body_poses].
+		// verticesP_ only stores body poses (active first, then fixed), so we write
+		// back body slots via verticesP_ with an offset that skips the ext slots.
+		const size_t nActiveBody = static_cast<size_t>(numBody_);
+		const size_t nExt = static_cast<size_t>(numExt_);
+
+		// Active body poses: qs_[0..nActiveBody) ↔ verticesP_[0..nActiveBody).
+		for (size_t i = 0; i < nActiveBody && i < verticesP_.size(); i++)
 		{
 			qs_[i].copyTo(verticesP_[i]->q.coeffs().data());
 			ts_[i].copyTo(verticesP_[i]->t.data());
+		}
+
+		// Ext joint slots: qs_[nActiveBody..nActiveBody+nExt) ↔ verticesEJoint_[0..nExt).
+		for (size_t i = 0; i < nExt && i < verticesEJoint_.size(); i++)
+		{
+			const size_t qIdx = nActiveBody + i;
+			qs_[qIdx].copyTo(verticesEJoint_[i]->q.coeffs().data());
+			ts_[qIdx].copyTo(verticesEJoint_[i]->t.data());
+		}
+
+		// Fixed body poses (pinned at start): qs_[nActiveBody+nExt..qs_.size())
+		// ↔ verticesP_[nActiveBody..verticesP_.size()).
+		for (size_t vpi = nActiveBody; vpi < verticesP_.size(); vpi++)
+		{
+			const size_t qIdx = nExt + vpi;  // shift by ext slot count
+			if (qIdx >= qs_.size()) break;
+			qs_[qIdx].copyTo(verticesP_[vpi]->q.coeffs().data());
+			ts_[qIdx].copyTo(verticesP_[vpi]->t.data());
 		}
 
 		for (size_t i = 0; i < verticesL_.size(); i++)
@@ -658,6 +945,10 @@ public:
 		chiSqs.clear();
 
 		chiSqs_.resize(baseEdges_.size());
+
+		// Joint mode: final solution resides in qs_/ts_; refresh q_exts_/t_exts_ so
+		// per-edge chi-squared uses the optimized extrinsics.
+		syncExtSolutionToPerEdge();
 
 		// compute chi-squares
 		gpu::computeChiSquares(d_qs_, d_ts_, d_cameras_, d_Xws_, d_measurements2D_,
@@ -706,9 +997,19 @@ private:
 	// graph components
 	std::vector<VertexP*> verticesP_;
 	std::vector<VertexL*> verticesL_;
+	std::vector<ExtrinsicsVertex*> verticesEJoint_;  // joint-mode unfixed ext vertices (iP in [numBody_, numBody_+numExt_))
 	std::vector<BaseEdge*> baseEdges_;
 	int numP_, numL_, nedges2D_, nedges3D_;
 	bool optimizeP_, optimizeL_;
+
+	// Joint-mode extrinsics optimization bookkeeping (Option A).
+		int numBody_;            //!< number of unfixed body pose vertices (iP in [0, numBody_))
+		int numExt_;             //!< number of unfixed ext vertices (iP in [numBody_, numBody_+numExt_))
+		bool extJoint_;          //!< TRIORB_OPTIMIZE_EXTRINSICS_JOINT=1 and unfixed ext vertices present
+		int nExtHplBlocks_;      //!< number of unique (iP_ext, iL) pairs contributing to Hpl
+		std::vector<int> edge2ExtIP_;                  //!< per-edge iP of ext vertex (-1 if absent/fixed)
+		std::vector<int> edge2HscPE_;                  //!< per-edge direct Hsc(body, ext) slot (-1 when absent/fixed)
+		std::vector<int> edge_to_ext_dedup_slot_;      //!< per-edge dedup slot id (-1 if no ext contribution)
 
 	// solution vectors
 	std::vector<Vec4d> qs_;
@@ -760,7 +1061,13 @@ private:
 	GpuVec2i d_edge2PL2D_, d_edge2PL3D_;
 	GpuVec1b d_edgeFlags2D_, d_edgeFlags3D_;
 	GpuVec1i d_edge2Hpl_, d_edge2Hpl2D_, d_edge2Hpl3D_;
-	GpuVec1d d_chiSqs_, d_chiSqs2D_, d_chiSqs3D_;
+	// Joint-mode ext Hpl slot per edge (-1 sentinel when no ext contribution).
+		GpuVec1i d_edge2HplExt_, d_edge2HplExt2D_, d_edge2HplExt3D_;
+		// Joint-mode ext iP per edge (-1 sentinel when ext is fixed or unused).
+		GpuVec1i d_edge2ExtIP_, d_edge2ExtIP2D_, d_edge2ExtIP3D_;
+		// Joint-mode direct Hsc(body, ext) slot per edge (-1 sentinel when absent/fixed).
+		GpuVec1i d_edge2HscPE_, d_edge2HscPE2D_, d_edge2HscPE3D_;
+		GpuVec1d d_chiSqs_, d_chiSqs2D_, d_chiSqs3D_;
 
 	// per-edge extrinsics on device
 	GpuVec4d d_q_exts_2D_, d_q_exts_3D_;
@@ -790,8 +1097,9 @@ private:
 	// schur complement of the H matrix
 	// HSc = Hpp - Hpl*inv(Hll)*HplT
 	// bSc = -bp + Hpl*inv(Hll)*bl
-	GpuHscBlockMat d_Hsc_;
-	GpuPx1BlockVec d_bsc_;
+		GpuHscBlockMat d_Hsc_;
+		GpuHscBlockMat d_HscDirect_;
+		GpuPx1BlockVec d_bsc_;
 	GpuLxLBlockVec d_invHll_;
 	GpuPxLBlockVec d_Hpl_invHll_;
 	GpuVec3i d_HscMulBlockIds_;
@@ -949,7 +1257,7 @@ public:
 
 	void initialize() override
 	{
-		solver_.initialize(vertexMapP_, vertexMapL_, edges2D_, edges3D_, kernels_);
+		solver_.initialize(vertexMapP_, vertexMapL_, vertexMapE_, edges2D_, edges3D_, kernels_);
 
 		stats_.clear();
 	}
@@ -980,6 +1288,9 @@ public:
 			
 			if (iteration == 0)
 				lambda = tau * solver_.maxDiagonal();
+			// Apply ext prior after maxDiagonal() so the LM lambda seed reflects
+			// the data Hessian rather than the prior-augmented diagonal.
+			solver_.applyExtPriorIfEnabled();
 			trace_cuda_ba("optimize lambda prepared: iteration=" + std::to_string(iteration) +
 				", lambda=" + std::to_string(lambda));
 

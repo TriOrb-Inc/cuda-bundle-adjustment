@@ -244,26 +244,33 @@ struct LandmarkVertex
 /** @brief Per-camera extrinsics vertex (6-DOF SE(3), stored as quaternion + translation).
 
 The extrinsics represent `camera_optical_from_body` and are shared by every edge
-belonging to the same physical camera. In P1.1 the vertex is created but held
-fixed (fixed=true), so values are routed through the existing per-edge
-`q_exts_`/`t_exts_` path without changing optimization dynamics. P1.2 will add
-Jacobian contributions and allow optimization.
+belonging to the same physical camera. When `fixed == true` the vertex is held
+constant and its values are routed through the per-edge `q_exts_`/`t_exts_` path
+without contributing to the optimization (this is the P1.1 behavior).
+
+When `fixed == false` (Option A, joint solve, enabled via `TRIORB_OPTIMIZE_EXTRINSICS_JOINT=1`)
+the vertex is appended to the pose vertex array after body poses and is updated
+via the same SE(3) retraction as body poses. In that mode `iP` holds the slot
+index inside the unified pose vertex array; `iE` is kept for backward
+compatibility with older diagnostic paths that read the extrinsics enumeration
+order, but production code should rely on `iP`.
 */
 struct ExtrinsicsVertex
 {
 	using Rotation = Eigen::Quaterniond;
 	using Translation = Array<double, 3>;
 
-	ExtrinsicsVertex() : q(Rotation::Identity()), t(Translation::Zero()), fixed(true), id(-1), iE(-1) {}
+	ExtrinsicsVertex() : q(Rotation::Identity()), t(Translation::Zero()), fixed(true), id(-1), iE(-1), iP(-1) {}
 
 	ExtrinsicsVertex(int id, const Rotation& q, const Translation& t, bool fixed = true)
-		: q(q), t(t), fixed(fixed), id(id), iE(-1) {}
+		: q(q), t(t), fixed(fixed), id(id), iE(-1), iP(-1) {}
 
 	Rotation q;              //!< rotation component (unit quaternion).
 	Translation t;           //!< translation component.
 	bool fixed;              //!< if true, the state variables are fixed during optimization.
 	int id;                  //!< ID of the vertex (external).
-	int iE;                  //!< ID of the vertex (internally used).
+	int iE;                  //!< legacy enumeration index (kept for diagnostic use).
+	int iP;                  //!< slot in the unified verticesP_ array (body poses first, ext after). -1 when fixed.
 	Set<BaseEdge*> edges;    //!< connected edges.
 };
 

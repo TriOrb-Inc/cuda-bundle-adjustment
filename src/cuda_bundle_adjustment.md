@@ -35,6 +35,7 @@
 - project 固有の判断は wrapper や利用側へ寄せ、この file 自体の変更理由を追いやすくする。
 - 長大 file でも source 本体は read-only 前提で扱い、補足説明は sidecar 文書へ追加する。
 - `TRIORB_CUDA_BA_TRACE=1` を付けると、Schur complement、CSR 変換、線形 solver 呼び出し、LM iteration の前後を `stderr` へ出して、Jetson 上の hang 箇所を段階別に追える。
+- joint extrinsics solve (`TRIORB_OPTIMIZE_EXTRINSICS_JOINT=1`) では、`CudaBlockSolver` が host 側で edge ごとの direct `Hsc(body, ext)` slot (`edge2HscPE_`) を解決し、GPU 側の `HscDirect` へ `Jp^TΩJe` を積ませる。`Hpl` / `Hschur` だけでは direct pose-ext coupling を表現できず `factorize failed` に落ちるため、host/device 両方でこの追加配線を持つ。
 
 ## 目標
 

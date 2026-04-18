@@ -16,6 +16,7 @@
 - `slam-core` 側 wrapper は solve 入口で `cudaSetDevice(0)` を呼びますが、Jetson AGX Thor のように driver / runtime の device context が不安定な host では、Thrust 側の host function でも thread-local device を握り直さないと `cudaErrorInvalidDevice` へ落ちることがあります。
 - reprojection edge の Jacobian は、従来の「post-extrinsics な `Xc` だけを見る近似式」から、per-edge extrinsics `R_ext` / `t_ext` を chain rule へ入れた正確な式へ更新しています。
 - `constructQuadraticFormKernel()` では `Xc = R_ext * Xc_body + t_ext` の逆変換から `Xc_body` を復元し、pose / landmark の両 Jacobian を `computeJacobiansExact()` で組み立てます。
+- joint extrinsics solve では `constructQuadraticFormKernel()` が ext diagonal (`Je^TΩJe`) や ext-landmark (`Je^TΩJl`) だけでなく、direct pose-ext block (`Jp^TΩJe`) も `HscDirect` へ積みます。これを `computeHschure()` の初期値として使い、Schur term だけでは表現できない同一 edge 内の body-ext coupling を落とさないようにします。
 
 ## 実装上の判断
 
@@ -24,6 +25,7 @@
 - wrapper 側の prewarm と重複して見えても、submodule 内の host helper が別のタイミングで実行される以上、この file 側でも context を明示する方を優先します。
 - multi-camera rig では camera optical frame への extrinsics が edge ごとに異なるため、Jacobian で `R_ext` を落とす近似は pose 更新方向を歪めます。ここでは投影 Jacobian `J_pi` に対して `J_pi * R_ext * R_body` を明示し、pose 回転成分も `[-Xc_body×]` を使って exact に計算します。
 - stereo の 3 residual 版も同じ方針でそろえ、右画像の `bf` 項だけを別扱いした projection Jacobian を `J_pi_ext` 経由で伝播させます。
+- `computeHschure()` は毎回 `Hpp` で対角を上書きする前に `HscDirect` を device-to-device copy し、direct pose-ext block を保持したまま Schur complement を加算します。これにより ext を `verticesP_` へ昇格した joint pathでも `factorize failed` に落ちにくい正常な法方程式を構成します。
 
 ## 目標
 
