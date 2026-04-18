@@ -92,6 +92,18 @@ void convertFixedPointHppExtRange(const long long* src_int,
 void convertFixedPointBpExtRange(const long long* src_int,
 	GpuPx1BlockVec& bp, int numBody, int numExt);
 
+// Option 4 Phase 3b: copy the body-range slots of a fixed-point int64 buffer
+// into the corresponding double slots of `Hpp` / `bp`. Only elements in
+// `[0, numBody)` are touched; ext-range slots are handled separately by the
+// *ExtRange helpers. When the deterministic path is active the caller
+// invokes both Body + Ext helpers after each `constructQuadraticForm()` to
+// cover the full `[0, numBody + numExt)` range.
+void convertFixedPointHppBodyRange(const long long* src_int,
+	GpuPxPBlockVec& Hpp, int numBody);
+
+void convertFixedPointBpBodyRange(const long long* src_int,
+	GpuPx1BlockVec& bp, int numBody);
+
 // Build per-edge ext Hpl slot vector. For each edge e:
 //   edge2HplExt[e] = (dedup_slot[e] < 0) ? -1 : edge2Hpl[nedges_total + dedup_slot[e]]
 void buildEdgeExtHpl(const int* h_dedup_slot_per_edge, int nedges_total,
