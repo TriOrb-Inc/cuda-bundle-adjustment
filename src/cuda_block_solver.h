@@ -45,13 +45,22 @@ Scalar computeActiveErrors(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5
 	const RobustKernel& kernel,
 	GpuVec3d& errors, GpuVec3d& Xcs, Scalar* chi);
 
+// Option 4 Phase 2: `Hpp_int_ext_raw` is a pointer into a `long long` buffer
+// that mirrors the layout of `Hpp.values()`. When non-null, the kernel routes
+// the `Hpp.at(iPExt)` block accumulation through a fixed-point int64 atomicAdd
+// path so the final values are bit-identical across runs. The caller is
+// responsible for (a) zeroing the buffer before this call and (b) invoking
+// `convertFixedPointHppExtRange` after the call to propagate the ext-range
+// slots into the double `Hpp` buffer. When null, the legacy
+// `atomicAdd(double*)` path is used, preserving the pre-Phase-2 behavior.
 void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVec5d& cameras, const GpuVec2d& errors,
 	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1i& edge2HplExt,
 	const GpuVec1i& edge2ExtIP, const GpuVec1i& edge2HscPE, const GpuVec1b& flags,
 	const GpuVec4d& q_exts, const GpuVec3d& t_exts, const GpuVec4d& distortions,
 	const RobustKernel& kernel,
 	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuHplBlockMat& Hpl,
-	GpuHscBlockMat& HscDirect);
+	GpuHscBlockMat& HscDirect,
+	long long* Hpp_int_ext_raw = nullptr);
 
 void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVec5d& cameras, const GpuVec3d& errors,
 	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1i& edge2HplExt,
@@ -59,7 +68,15 @@ void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVe
 	const GpuVec4d& q_exts, const GpuVec3d& t_exts,
 	const RobustKernel& kernel,
 	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuHplBlockMat& Hpl,
-	GpuHscBlockMat& HscDirect);
+	GpuHscBlockMat& HscDirect,
+	long long* Hpp_int_ext_raw = nullptr);
+
+// Option 4 Phase 2: copy the ext-range slots of a fixed-point int64 buffer
+// (`src_int`, sized identically to `Hpp.values()`) into the corresponding
+// double slots of `Hpp`. Only elements in `[numBody, numBody + numExt)` are
+// touched; body-pose slots are left untouched.
+void convertFixedPointHppExtRange(const long long* src_int,
+	GpuPxPBlockVec& Hpp, int numBody, int numExt);
 
 // Build per-edge ext Hpl slot vector. For each edge e:
 //   edge2HplExt[e] = (dedup_slot[e] < 0) ? -1 : edge2Hpl[nedges_total + dedup_slot[e]]
