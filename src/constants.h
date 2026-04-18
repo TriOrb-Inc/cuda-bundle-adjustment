@@ -32,7 +32,8 @@ enum StorageOrder
 enum EdgeFlag
 {
 	EDGE_FLAG_FIXED_L = 1,
-	EDGE_FLAG_FIXED_P = 2
+	EDGE_FLAG_FIXED_P = 2,
+	EDGE_FLAG_FIXED_E = 4
 };
 
 } // namespace cuba
