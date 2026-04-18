@@ -1066,17 +1066,20 @@ __global__ void constructQuadraticFormKernel(int nedges, const Vec3d* Xcs, const
 	const uint8_t* flags, RobustKernelFunc<RK_TYPE> robustKernel,
 	PxPBlockPtr Hpp, Px1BlockPtr bp, LxLBlockPtr Hll, Lx1BlockPtr bl, PxLBlockPtr Hpl, PxPBlockPtr HscDirect,
 	const Vec4d* q_exts, const Vec3d* t_exts, const Vec4d* distortions,
-	// Option 4 Phase 2+: when non-null, accumulate the `Hpp.at(iPExt)` block into
-	// this fixed-point int64 buffer instead of the double `Hpp` buffer. The
-	// ext-range slots will be converted back to double after the kernel
-	// finishes via `convertFixedPointHppExtRange`. When null, the legacy
-	// `atomicAdd(double*)` path is used.
+	// Option 4 Phase 2+: when non-null, the kernel routes the body/ext
+	// accumulations for `Hpp` and `bp` into these fixed-point int64 mirror
+	// buffers instead of the double buffers, so the final values are
+	// bit-identical across runs for the covered slots.
+	//   Phase 2 : `Hpp.at(iPExt)`         — ext-range slot in [numBody, numBody+numExt).
+	//   Phase 3a: `bp.at(iPExt)`          — same iPExt slot (PDIM scalars).
+	//   Phase 3b: `Hpp.at(iP)` / `bp.at(iP)` — body-range slots in [0, numBody).
+	// After the kernel, the caller propagates the full [0, numBody+numExt)
+	// range back to the double buffers via `convertFixedPointHppBodyRange` +
+	// `convertFixedPointHppExtRange` (and the matching bp helpers). Remaining
+	// legacy atomic sites (`Hll`, `bl`, `HscDirect`, `Hpl.at(hplExtSlot)`,
+	// Schur update) continue to use `atomicAdd(double*)` and will be migrated
+	// in Phase 3c+.
 	long long* Hpp_int_ext_raw = nullptr,
-	// Option 4 Phase 3a: same pattern for the `bp.at(iPExt)` vector. When
-	// non-null, accumulate into this fixed-point int64 buffer and convert back
-	// after the kernel via `convertFixedPointBpExtRange`. Remaining legacy
-	// atomic sites (`Hpp.at(iP)`, `Hll`, `bp.at(iP)`, `bl`, `HscDirect`,
-	// `Hpl.at(hplExtSlot)`, Schur update) will be migrated in Phase 3b+.
 	long long* bp_int_ext_raw = nullptr)
 {
 	using Vecmd = Vecxd<MDIM>;
@@ -1138,11 +1141,32 @@ __global__ void constructQuadraticFormKernel(int nedges, const Vec3d* Xcs, const
 
 	if (!(flag & EDGE_FLAG_FIXED_P))
 	{
-		// Hpp += = JPT*Omega*JP
-		MatTMulMat<PDIM, MDIM, PDIM, ACCUM_ATOMIC>(JP, JP, Hpp.at(iP), omega);
-
-		// bp += = JPT*Omega*r
-		MatTMulVec<PDIM, MDIM, ACCUM_ATOMIC>(JP, error.data, bp.at(iP), omega);
+		// Option 4 Phase 3b: deterministic body-range Hpp[iP] + bp[iP] when
+		// the int64 mirror buffers are supplied. `iP` is a body-range index
+		// in [0, numBody); Phase 2/3a ext-range writes use a separate iPExt
+		// in the disjoint range [numBody, numBody+numExt), so body and ext
+		// slots never collide. When the buffers are null we fall back to the
+		// legacy `atomicAdd(double*)` path.
+		if (Hpp_int_ext_raw != nullptr)
+		{
+			MatTMulMatDet<PDIM, MDIM, PDIM>(JP, JP,
+				Hpp_int_ext_raw + iP * PDIM * PDIM, omega);
+		}
+		else
+		{
+			// Hpp += = JPT*Omega*JP
+			MatTMulMat<PDIM, MDIM, PDIM, ACCUM_ATOMIC>(JP, JP, Hpp.at(iP), omega);
+		}
+		if (bp_int_ext_raw != nullptr)
+		{
+			MatTMulVecDet<PDIM, MDIM>(JP, error.data,
+				bp_int_ext_raw + iP * PDIM, omega);
+		}
+		else
+		{
+			// bp += = JPT*Omega*r
+			MatTMulVec<PDIM, MDIM, ACCUM_ATOMIC>(JP, error.data, bp.at(iP), omega);
+		}
 	}
 	if (!(flag & EDGE_FLAG_FIXED_L))
 	{
@@ -2234,6 +2258,45 @@ void convertFixedPointBpExtRange(const long long* src_int,
 	const int grid = divUp(n, block);
 	deterministic::fixedPointToDoubleKernel<<<grid, block>>>(
 		n, src_int + offset, bp.values() + offset);
+	CUDA_CHECK(cudaGetLastError());
+}
+
+// Option 4 Phase 3b: copy the body-range slots of a fixed-point int64 buffer
+// (`src_int`, sized identically to `Hpp.values()`) into the corresponding
+// double slots of `Hpp`. Only elements in `[0, numBody)` are touched;
+// ext-range slots are left untouched (they are handled separately by
+// `convertFixedPointHppExtRange`).
+void convertFixedPointHppBodyRange(const long long* src_int,
+	GpuPxPBlockVec& Hpp, int numBody)
+{
+	if (numBody <= 0 || src_int == nullptr)
+		return;
+	prepareCudaThreadContext();
+	constexpr int BLOCK_SIZE = PDIM * PDIM;
+	const int n = numBody * BLOCK_SIZE;
+	const int block = 256;
+	const int grid = divUp(n, block);
+	deterministic::fixedPointToDoubleKernel<<<grid, block>>>(
+		n, src_int, Hpp.values());
+	CUDA_CHECK(cudaGetLastError());
+}
+
+// Option 4 Phase 3b: copy the body-range slots of a fixed-point int64 buffer
+// (`src_int`, sized identically to `bp.values()`) into the corresponding
+// double slots of `bp`. Only elements in `[0, numBody)` are touched;
+// ext-range slots are left untouched.
+void convertFixedPointBpBodyRange(const long long* src_int,
+	GpuPx1BlockVec& bp, int numBody)
+{
+	if (numBody <= 0 || src_int == nullptr)
+		return;
+	prepareCudaThreadContext();
+	constexpr int BLOCK_SIZE = PDIM;
+	const int n = numBody * BLOCK_SIZE;
+	const int block = 256;
+	const int grid = divUp(n, block);
+	deterministic::fixedPointToDoubleKernel<<<grid, block>>>(
+		n, src_int, bp.values());
 	CUDA_CHECK(cudaGetLastError());
 }
 
