@@ -152,6 +152,25 @@ void convertFixedPointHscDirect(const long long* src_int,
 void convertFixedPointHplExtSlots(const long long* src_int,
 	GpuHplBlockMat& Hpl, const int* extSlotGlobalIds, int nExtDedupSlots);
 
+// Option 4 Phase 3f: additive fixed-point propagation for the two Schur
+// complement atomic sites inside `computeBschureKernel` (bsc vector) and
+// `computeHschureKernel` (Hschur block matrix). The double `bsc` / `Hsc`
+// buffers are pre-initialized by the existing deterministic preambles
+// (`bp.copyTo(bsc)` for bsc; `cudaMemcpy(HscDirect) + initializeHschurKernel`
+// for Hsc). When the deterministic path is active, the kernel routes only
+// the Schur-complement decrement (DEACCUM_ATOMIC) through an int64 mirror
+// buffer; these helpers then add `fromFixedPoint(src_int[i])` back into the
+// double buffer in one pass. Caller must zero `src_int` before the kernel
+// launch.
+//
+// `convertFixedPointBsc` touches `numP * PDIM` scalars.
+// `convertFixedPointHsc` touches `nnz * PDIM * PDIM` scalars.
+void convertFixedPointBsc(const long long* src_int,
+	GpuPx1BlockVec& bsc, int numP);
+
+void convertFixedPointHsc(const long long* src_int,
+	GpuHscBlockMat& Hsc, int nnz);
+
 // Build per-edge ext Hpl slot vector. For each edge e:
 //   edge2HplExt[e] = (dedup_slot[e] < 0) ? -1 : edge2Hpl[nedges_total + dedup_slot[e]]
 void buildEdgeExtHpl(const int* h_dedup_slot_per_edge, int nedges_total,
@@ -194,11 +213,20 @@ void restoreDiagonal(GpuPxPBlockVec& Hpp, const GpuPx1BlockVec& backup);
 
 void restoreDiagonal(GpuLxLBlockVec& Hll, const GpuLx1BlockVec& backup);
 
+// Option 4 Phase 3f: optional `bsc_int_raw` / `Hschur_int_raw` int64 buffers
+// to route the Schur-complement DEACCUM_ATOMIC updates through deterministic
+// fixed-point accumulation. When non-null, the caller must (a) zero the
+// buffer prior to the call, and (b) invoke `convertFixedPointBsc` /
+// `convertFixedPointHsc` afterwards to propagate the decrement back into
+// the matching double buffer. When null, the legacy `atomicAdd(double*)`
+// path is preserved.
 void computeBschure(const GpuPx1BlockVec& bp, const GpuHplBlockMat& Hpl, const GpuLxLBlockVec& Hll,
-	const GpuLx1BlockVec& bl, GpuPx1BlockVec& bsc, GpuLxLBlockVec& invHll, GpuPxLBlockVec& Hpl_invHll);
+	const GpuLx1BlockVec& bl, GpuPx1BlockVec& bsc, GpuLxLBlockVec& invHll, GpuPxLBlockVec& Hpl_invHll,
+	long long* bsc_int_raw = nullptr);
 
 void computeHschure(const GpuPxPBlockVec& Hpp, const GpuHscBlockMat& HscDirect, const GpuPxLBlockVec& Hpl_invHll,
-	const GpuHplBlockMat& Hpl, const GpuVec3i& mulBlockIds, GpuHscBlockMat& Hsc);
+	const GpuHplBlockMat& Hpl, const GpuVec3i& mulBlockIds, GpuHscBlockMat& Hsc,
+	long long* Hschur_int_raw = nullptr);
 
 void convertHschureBSRToCSR(const GpuHscBlockMat& HscBSR, const GpuVec1i& BSR2CSR, GpuVec1d& HscCSR);
 
