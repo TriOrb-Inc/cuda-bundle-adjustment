@@ -89,6 +89,19 @@ OrderingMethod resolve_ordering_method()
 		return OrderingMethod::kNone;
 	}
 
+	// Option 4 Phase 5: METIS nested-dissection uses a randomized initial
+	// partition (default seed is time-based), so the permutation `P` differs
+	// across runs and Cholesky factor `L` floats a few ULPs in spite of the
+	// deterministic int64 atomic accumulation. When the caller asks for
+	// deterministic BA, fall back to `symrcm`, which is a deterministic
+	// graph ordering (reverse Cuthill–McKee). Callers can still opt back
+	// into METIS by setting `TRIORB_CUDA_BA_ORDERING=metis` explicitly.
+	const char* env_det_accum = std::getenv("TRIORB_CUDA_BA_DETERMINISTIC_ACCUM");
+	if (env_det_accum != nullptr && std::string(env_det_accum) == "1")
+	{
+		return OrderingMethod::kSymRcm;
+	}
+
 	return OrderingMethod::kMetis;
 }
 

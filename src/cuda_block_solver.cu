@@ -1939,7 +1939,16 @@ void buildHplStructure(GpuVec3i& blockpos, GpuHplBlockMat& Hpl, GpuVec1i& indexP
 	int* rowInd = Hpl.innerIndices();
 
 	auto ptrBlockPos = thrust::device_pointer_cast(blockpos.data());
-	thrust::sort(ptrBlockPos, ptrBlockPos + nblocks, LessColId());
+	// Option 4 Phase 5: `thrust::sort` is not stable. When multiple edges contribute
+	// to the same (row, col) Hpl block (e.g., a landmark observed by multiple cameras
+	// in the same pose), their edgeId tie-breaks after the primary (col, row) keys,
+	// and a non-stable sort may permute them across runs. That permutes
+	// `indexPL[edgeId] = k`, so the per-edge ASSIGN into `Hpl.at(edge2Hpl[iE])` routes
+	// each edge's Jacobian into a different block slot than the previous run. The
+	// downstream Schur complement still sums consistently, but the per-block memory
+	// layout and floating-point accumulation order through Hpl→Hschur flip between
+	// runs. Use `stable_sort` so the edge ordering is reproducible.
+	thrust::stable_sort(ptrBlockPos, ptrBlockPos + nblocks, LessColId());
 
 	CUDA_CHECK(cudaMemset(nnzPerCol, 0, sizeof(int) * (Hpl.cols() + 1)));
 	nnzPerColKernel<<<grid, block>>>(blockpos, nblocks, nnzPerCol);
@@ -1974,7 +1983,14 @@ void findHschureMulBlockIndices(const GpuHplBlockMat& Hpl, const GpuHscBlockMat&
 	CUDA_CHECK(cudaGetLastError());
 
 	auto ptrSrc = thrust::device_pointer_cast(mulBlockIds.data());
-	thrust::sort(ptrSrc, ptrSrc + mulBlockIds.size(), LessRowId());
+	// Option 4 Phase 5: stable sort so that mulBlockIds with identical (row, col)
+	// keep their original order across runs. The slots with same (iP1, iP2) are
+	// consumed sequentially by computeHschureKernel, and a non-stable permutation
+	// of the consumption order affects the deterministic int64 accumulation
+	// pattern inside the Schur update (accumulation itself is deterministic, but
+	// downstream sentinel slot placement `(-1)` depends on the stable prefix
+	// written by findHschureMulBlockIndicesKernel via `atomicAdd(nindices, 1)`).
+	thrust::stable_sort(ptrSrc, ptrSrc + mulBlockIds.size(), LessRowId());
 }
 
 template <int MDIM, int RK_TYPE = 0>
