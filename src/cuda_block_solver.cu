@@ -1066,23 +1066,27 @@ __global__ void constructQuadraticFormKernel(int nedges, const Vec3d* Xcs, const
 	const uint8_t* flags, RobustKernelFunc<RK_TYPE> robustKernel,
 	PxPBlockPtr Hpp, Px1BlockPtr bp, LxLBlockPtr Hll, Lx1BlockPtr bl, PxLBlockPtr Hpl, PxPBlockPtr HscDirect,
 	const Vec4d* q_exts, const Vec3d* t_exts, const Vec4d* distortions,
-	// Option 4 Phase 2+: when non-null, the kernel routes the body/ext
-	// accumulations for `Hpp`, `bp`, `Hll`, and `bl` into these fixed-point
-	// int64 mirror buffers instead of the double buffers, so the final
-	// values are bit-identical across runs for the covered slots.
+	// Option 4 Phase 2+: when non-null, the kernel routes the body/ext/landmark
+	// accumulations for `Hpp`, `bp`, `Hll`, `bl`, `HscDirect`, and the
+	// ext-slot portion of `Hpl` into these fixed-point int64 mirror buffers
+	// instead of the double buffers, so the final values are bit-identical
+	// across runs for the covered slots.
 	//   Phase 2 : `Hpp.at(iPExt)`         — ext-range slot in [numBody, numBody+numExt).
 	//   Phase 3a: `bp.at(iPExt)`          — same iPExt slot (PDIM scalars).
 	//   Phase 3b: `Hpp.at(iP)` / `bp.at(iP)` — body-range slots in [0, numBody).
 	//   Phase 3c: `Hll.at(iL)` / `bl.at(iL)` — landmark-range slots in [0, numL).
+	//   Phase 3d: `HscDirect.at(hscPESlot)` — direct body×ext Hsc cross blocks
+	//             (PDIM×PDIM). Layout matches `HscDirect.values()`; slot
+	//             indexing is dense across `d_HscDirect_.nnz()` blocks.
 	// After the kernel, the caller propagates the covered ranges back to the
 	// double buffers via the matching `convertFixedPoint*Range` helpers.
-	// Remaining legacy atomic sites (`HscDirect`, `Hpl.at(hplExtSlot)`,
-	// Schur update) continue to use `atomicAdd(double*)` and will be migrated
-	// in Phase 3d+.
+	// Remaining legacy atomic sites (`Hpl.at(hplExtSlot)`, Schur update)
+	// continue to use `atomicAdd(double*)` and will be migrated in Phase 3e+.
 	long long* Hpp_int_ext_raw = nullptr,
 	long long* bp_int_ext_raw = nullptr,
 	long long* Hll_int_raw = nullptr,
-	long long* bl_int_raw = nullptr)
+	long long* bl_int_raw = nullptr,
+	long long* HscDirect_int_raw = nullptr)
 {
 	using Vecmd = Vecxd<MDIM>;
 
@@ -1352,7 +1356,22 @@ __global__ void constructQuadraticFormKernel(int nedges, const Vec3d* Xcs, const
 			}
 			if (!(flag & EDGE_FLAG_FIXED_P) && hscPESlot >= 0)
 			{
-				MatTMulMat<PDIM, MDIM, PDIM, ACCUM_ATOMIC>(JP, JE, HscDirect.at(hscPESlot), omega);
+				// Option 4 Phase 3d: deterministic accumulation for the direct
+				// body×ext Schur cross-block `HscDirect.at(hscPESlot)`. The
+				// int64 buffer is laid out identically to `HscDirect.values()`
+				// (PDIM*PDIM scalars per slot), so `hscPESlot * (PDIM*PDIM)`
+				// gives the start of this slot. Multiple edges may share the
+				// same (iP, iPExt) slot when they project to the same
+				// keyframe / camera pair.
+				if (HscDirect_int_raw != nullptr)
+				{
+					MatTMulMatDet<PDIM, MDIM, PDIM>(JP, JE,
+						HscDirect_int_raw + hscPESlot * (PDIM * PDIM), omega);
+				}
+				else
+				{
+					MatTMulMat<PDIM, MDIM, PDIM, ACCUM_ATOMIC>(JP, JE, HscDirect.at(hscPESlot), omega);
+				}
 			}
 			if (hplExtSlot >= 0 && !(flag & EDGE_FLAG_FIXED_L))
 			{
@@ -1938,7 +1957,8 @@ void constructQuadraticForm_(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuV
 	long long* Hpp_int_ext_raw,
 	long long* bp_int_ext_raw,
 	long long* Hll_int_raw,
-	long long* bl_int_raw)
+	long long* bl_int_raw,
+	long long* HscDirect_int_raw)
 {
 	const auto& errors = _errors.getRef<Vecxd<MDIM>>();
 	const RobustKernelFunc<RK_TYPE> robustKernel(robustDelta);
@@ -1956,7 +1976,7 @@ void constructQuadraticForm_(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuV
 
 	constructQuadraticFormKernel<MDIM, RK_TYPE><<<grid, block>>>(nedges, Xcs, qs, cameras, errors, omegas,
 		edge2PL, edge2Hpl, edge2HplExt, edge2ExtIP, edge2HscPE, flags, robustKernel, Hpp, bp, Hll, bl, Hpl, HscDirect,
-		q_exts, t_exts, d_dist_ptr, Hpp_int_ext_raw, bp_int_ext_raw, Hll_int_raw, bl_int_raw);
+		q_exts, t_exts, d_dist_ptr, Hpp_int_ext_raw, bp_int_ext_raw, Hll_int_raw, bl_int_raw, HscDirect_int_raw);
 	CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1964,7 +1984,7 @@ using ConstructQuadraticFormFunc = void(*)(const GpuVec3d&, const GpuVec4d&, con
 	const GpuVec1d&, const GpuVec2i&, const GpuVec1i&, const GpuVec1i&, const GpuVec1i&, const GpuVec1i&, const GpuVec1b&,
 	const GpuVec4d&, const GpuVec3d&, const GpuVec4d&, Scalar,
 	GpuPxPBlockVec&, GpuPx1BlockVec&, GpuLxLBlockVec&, GpuLx1BlockVec&, GpuHplBlockMat&, GpuHscBlockMat&,
-	long long*, long long*, long long*, long long*);
+	long long*, long long*, long long*, long long*, long long*);
 
 static ConstructQuadraticFormFunc constructQuadraticFormFuncs[6] =
 {
@@ -1986,10 +2006,11 @@ void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVe
 	long long* Hpp_int_ext_raw,
 	long long* bp_int_ext_raw,
 	long long* Hll_int_raw,
-	long long* bl_int_raw)
+	long long* bl_int_raw,
+	long long* HscDirect_int_raw)
 {
 	auto func = constructQuadraticFormFuncs[0 + kernel.type];
-	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, edge2HplExt, edge2ExtIP, edge2HscPE, flags, q_exts, t_exts, distortions, kernel.delta, Hpp, bp, Hll, bl, Hpl, HscDirect, Hpp_int_ext_raw, bp_int_ext_raw, Hll_int_raw, bl_int_raw);
+	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, edge2HplExt, edge2ExtIP, edge2HscPE, flags, q_exts, t_exts, distortions, kernel.delta, Hpp, bp, Hll, bl, Hpl, HscDirect, Hpp_int_ext_raw, bp_int_ext_raw, Hll_int_raw, bl_int_raw, HscDirect_int_raw);
 }
 
 void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVec5d& cameras, const GpuVec3d& errors,
@@ -2002,12 +2023,13 @@ void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVe
 	long long* Hpp_int_ext_raw,
 	long long* bp_int_ext_raw,
 	long long* Hll_int_raw,
-	long long* bl_int_raw)
+	long long* bl_int_raw,
+	long long* HscDirect_int_raw)
 {
 	// 3D (stereo) path: no distortion support, pass empty GpuVec4d
 	static GpuVec4d empty_distortions;
 	auto func = constructQuadraticFormFuncs[3 + kernel.type];
-	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, edge2HplExt, edge2ExtIP, edge2HscPE, flags, q_exts, t_exts, empty_distortions, kernel.delta, Hpp, bp, Hll, bl, Hpl, HscDirect, Hpp_int_ext_raw, bp_int_ext_raw, Hll_int_raw, bl_int_raw);
+	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, edge2HplExt, edge2ExtIP, edge2HscPE, flags, q_exts, t_exts, empty_distortions, kernel.delta, Hpp, bp, Hll, bl, Hpl, HscDirect, Hpp_int_ext_raw, bp_int_ext_raw, Hll_int_raw, bl_int_raw, HscDirect_int_raw);
 }
 
 template <int MDIM>
@@ -2365,6 +2387,27 @@ void convertFixedPointBlRange(const long long* src_int,
 	const int grid = divUp(n, block);
 	deterministic::fixedPointToDoubleKernel<<<grid, block>>>(
 		n, src_int, bl.values());
+	CUDA_CHECK(cudaGetLastError());
+}
+
+// Option 4 Phase 3d: copy the full non-zero slot range of a fixed-point int64
+// buffer into the double `HscDirect` block matrix. HscDirect only receives
+// writes through the atomic accumulation path (there is no ASSIGN path), so
+// the entire `[0, nnz * PDIM * PDIM)` range is converted unconditionally.
+// `src_int` must be sized identically to `HscDirect.values()` and zeroed
+// prior to accumulation.
+void convertFixedPointHscDirect(const long long* src_int,
+	GpuHscBlockMat& HscDirect, int nnz)
+{
+	if (nnz <= 0 || src_int == nullptr)
+		return;
+	prepareCudaThreadContext();
+	constexpr int BLOCK_AREA = PDIM * PDIM;
+	const int n = nnz * BLOCK_AREA;
+	const int block = 256;
+	const int grid = divUp(n, block);
+	deterministic::fixedPointToDoubleKernel<<<grid, block>>>(
+		n, src_int, HscDirect.values());
 	CUDA_CHECK(cudaGetLastError());
 }
 

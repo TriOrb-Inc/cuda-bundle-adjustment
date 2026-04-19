@@ -46,20 +46,22 @@ Scalar computeActiveErrors(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5
 	GpuVec3d& errors, GpuVec3d& Xcs, Scalar* chi);
 
 // Option 4 Phase 2+: `Hpp_int_ext_raw` / `bp_int_ext_raw` / `Hll_int_raw` /
-// `bl_int_raw` are pointers into `long long` buffers that mirror the layouts
-// of `Hpp.values()`, `bp.values()`, `Hll.values()`, and `bl.values()`
-// respectively. When non-null, the kernel routes the corresponding block /
-// vector accumulations through a fixed-point int64 atomicAdd path so the
-// final values are bit-identical across runs. The caller is responsible for
-// (a) zeroing each buffer before this call and (b) invoking the paired
-// `convertFixedPoint*Range` helpers after the call to propagate slots back
-// into the double `Hpp` / `bp` / `Hll` / `bl` buffers. When null, the legacy
-// `atomicAdd(double*)` path is used, preserving the pre-Phase-2 behavior.
-// Phase 3a adds `bp_int_ext_raw`; Phase 3b adds body-range conversion through
-// the same `Hpp_int_ext_raw` / `bp_int_ext_raw` buffers; Phase 3c adds
-// `Hll_int_raw` / `bl_int_raw` for the full landmark range. Remaining atomic
-// sites (`HscDirect`, `Hpl.at(hplExtSlot)`, Schur update) will be migrated in
-// Phase 3d+.
+// `bl_int_raw` / `HscDirect_int_raw` are pointers into `long long` buffers
+// that mirror the layouts of `Hpp.values()`, `bp.values()`, `Hll.values()`,
+// `bl.values()`, and `HscDirect.values()` respectively. When non-null, the
+// kernel routes the corresponding block / vector accumulations through a
+// fixed-point int64 atomicAdd path so the final values are bit-identical
+// across runs. The caller is responsible for (a) zeroing each buffer before
+// this call and (b) invoking the paired `convertFixedPoint*Range` /
+// `convertFixedPointHscDirect` helpers after the call to propagate slots
+// back into the double buffers. When null, the legacy `atomicAdd(double*)`
+// path is used, preserving the pre-Phase-2 behavior. Phase 3a adds
+// `bp_int_ext_raw`; Phase 3b adds body-range conversion through the same
+// `Hpp_int_ext_raw` / `bp_int_ext_raw` buffers; Phase 3c adds
+// `Hll_int_raw` / `bl_int_raw` for the full landmark range; Phase 3d adds
+// `HscDirect_int_raw` for the direct body×ext Schur cross-block. Remaining
+// atomic sites (`Hpl.at(hplExtSlot)`, Schur update) will be migrated in
+// Phase 3e+.
 void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVec5d& cameras, const GpuVec2d& errors,
 	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1i& edge2HplExt,
 	const GpuVec1i& edge2ExtIP, const GpuVec1i& edge2HscPE, const GpuVec1b& flags,
@@ -70,7 +72,8 @@ void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVe
 	long long* Hpp_int_ext_raw = nullptr,
 	long long* bp_int_ext_raw = nullptr,
 	long long* Hll_int_raw = nullptr,
-	long long* bl_int_raw = nullptr);
+	long long* bl_int_raw = nullptr,
+	long long* HscDirect_int_raw = nullptr);
 
 void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVec5d& cameras, const GpuVec3d& errors,
 	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1i& edge2HplExt,
@@ -82,7 +85,8 @@ void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVe
 	long long* Hpp_int_ext_raw = nullptr,
 	long long* bp_int_ext_raw = nullptr,
 	long long* Hll_int_raw = nullptr,
-	long long* bl_int_raw = nullptr);
+	long long* bl_int_raw = nullptr,
+	long long* HscDirect_int_raw = nullptr);
 
 // Option 4 Phase 2: copy the ext-range slots of a fixed-point int64 buffer
 // (`src_int`, sized identically to `Hpp.values()`) into the corresponding
@@ -121,6 +125,15 @@ void convertFixedPointHllRange(const long long* src_int,
 
 void convertFixedPointBlRange(const long long* src_int,
 	GpuLx1BlockVec& bl, int numL);
+
+// Option 4 Phase 3d: copy the full non-zero slot range of a fixed-point int64
+// buffer into the double `HscDirect` block matrix. HscDirect only receives
+// atomic accumulation writes (no ASSIGN path) so the entire `[0, nnz)` slot
+// range (`nnz * PDIM * PDIM` scalars) is converted unconditionally.
+// `src_int` must be sized identically to `HscDirect.values()` and zeroed
+// prior to `constructQuadraticForm`.
+void convertFixedPointHscDirect(const long long* src_int,
+	GpuHscBlockMat& HscDirect, int nnz);
 
 // Build per-edge ext Hpl slot vector. For each edge e:
 //   edge2HplExt[e] = (dedup_slot[e] < 0) ? -1 : edge2Hpl[nedges_total + dedup_slot[e]]
