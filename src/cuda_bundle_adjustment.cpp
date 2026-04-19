@@ -595,6 +595,19 @@ public:
 				d_HscDirect_.resizeNonZeros(Hsc_.nblocks());
 				d_HscDirect_.upload(nullptr, Hsc_.outerIndices(), Hsc_.innerIndices());
 
+				// Phase 3d: allocate fixed-point int64 mirror for d_HscDirect_
+				// when deterministic accumulation is active on the joint ext
+				// path. The HscDirect structure is only populated inside this
+				// `optimizeP_ && optimizeL_` block and only receives atomic
+				// writes (no ASSIGN), so sizing from `d_HscDirect_.nnz()` is
+				// safe here (after resizeNonZeros above).
+				if (deterministicAccum_ && extJoint_ && numExt_ > 0 && d_HscDirect_.nnz() > 0)
+				{
+					const size_t nHsc = static_cast<size_t>(d_HscDirect_.nnz()) *
+						static_cast<size_t>(PDIM) * static_cast<size_t>(PDIM);
+					d_HscDirect_int_.resize(nHsc);
+				}
+
 			d_HscCSR_.resize(Hsc_.nnzSymm());
 			d_BSR2CSR_.assign(Hsc_.nnzSymm(), (int*)Hsc_.BSR2CSR());
 
@@ -825,11 +838,22 @@ public:
 				d_bl_int_ptr = d_bl_int_.data();
 			}
 
+			// Phase 3d: deterministic HscDirect[hscPESlot] accumulation. Shares
+			// the ext-joint gate with Phase 2/3a/3b since HscDirect is only
+			// populated when joint extrinsics optimization is active.
+			const bool useDetAccumHsc = useDetAccum && d_HscDirect_.nnz() > 0;
+			long long* d_HscDirect_int_ptr = nullptr;
+			if (useDetAccumHsc)
+			{
+				d_HscDirect_int_.fillZero();
+				d_HscDirect_int_ptr = d_HscDirect_int_.data();
+			}
+
 			gpu::constructQuadraticForm(d_Xcs2D_, d_qs_, d_cameras_, d_errors2D_, d_omegas2D_, d_edge2PL2D_,
-				d_edge2Hpl2D_, d_edge2HplExt2D_, d_edge2ExtIP2D_, d_edge2HscPE2D_, d_edgeFlags2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, kernels_[0], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_, d_Hpp_int_ext_ptr, d_bp_int_ext_ptr, d_Hll_int_ptr, d_bl_int_ptr);
+				d_edge2Hpl2D_, d_edge2HplExt2D_, d_edge2ExtIP2D_, d_edge2HscPE2D_, d_edgeFlags2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, kernels_[0], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_, d_Hpp_int_ext_ptr, d_bp_int_ext_ptr, d_Hll_int_ptr, d_bl_int_ptr, d_HscDirect_int_ptr);
 
 			gpu::constructQuadraticForm(d_Xcs3D_, d_qs_, d_cameras_, d_errors3D_, d_omegas3D_, d_edge2PL3D_,
-				d_edge2Hpl3D_, d_edge2HplExt3D_, d_edge2ExtIP3D_, d_edge2HscPE3D_, d_edgeFlags3D_, d_q_exts_3D_, d_t_exts_3D_, kernels_[1], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_, d_Hpp_int_ext_ptr, d_bp_int_ext_ptr, d_Hll_int_ptr, d_bl_int_ptr);
+				d_edge2Hpl3D_, d_edge2HplExt3D_, d_edge2ExtIP3D_, d_edge2HscPE3D_, d_edgeFlags3D_, d_q_exts_3D_, d_t_exts_3D_, kernels_[1], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_, d_Hpp_int_ext_ptr, d_bp_int_ext_ptr, d_Hll_int_ptr, d_bl_int_ptr, d_HscDirect_int_ptr);
 
 			if (useDetAccum)
 			{
@@ -852,6 +876,13 @@ public:
 				// optimization is disabled.
 				gpu::convertFixedPointHllRange(d_Hll_int_ptr, d_Hll_, numL_);
 				gpu::convertFixedPointBlRange(d_bl_int_ptr, d_bl_, numL_);
+			}
+			if (useDetAccumHsc)
+			{
+				// Phase 3d: propagate the full HscDirect non-zero range back
+				// into double. HscDirect has no ASSIGN writes so the entire
+				// `[0, nnz * PDIM * PDIM)` range is converted.
+				gpu::convertFixedPointHscDirect(d_HscDirect_int_ptr, d_HscDirect_, d_HscDirect_.nnz());
 			}
 
 		const auto t1 = get_time_point();
@@ -1214,6 +1245,12 @@ private:
 	// bSc = -bp + Hpl*inv(Hll)*bl
 		GpuHscBlockMat d_Hsc_;
 		GpuHscBlockMat d_HscDirect_;
+		// Option 4 Phase 3d: fixed-point int64 mirror of d_HscDirect_.values()
+		// used for deterministic atomicAdd on the direct body×ext Schur cross
+		// block. Allocated only when deterministicAccum_ && extJoint_ &&
+		// numExt_>0 && d_HscDirect_.nnz()>0. Size ==
+		// d_HscDirect_.nnz() * PDIM * PDIM.
+		DeviceBuffer<long long> d_HscDirect_int_;
 		GpuPx1BlockVec d_bsc_;
 	GpuLxLBlockVec d_invHll_;
 	GpuPxLBlockVec d_Hpl_invHll_;
