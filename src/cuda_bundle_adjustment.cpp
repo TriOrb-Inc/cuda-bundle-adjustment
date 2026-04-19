@@ -555,6 +555,16 @@ public:
 			d_bl_.map(numL_, d_b_.data() + numP_ * PDIM);
 			d_Hll_.resize(numL_);
 			d_HllBackup_.resize(numL_);
+
+			// Phase 3c: allocate fixed-point int64 mirror buffers for d_Hll_ and
+			// d_bl_ whenever deterministic accumulation is requested. The gate is
+			// independent of extJoint_ because landmark atomic sites accumulate
+			// for every edge (not just ext-coupled ones).
+			if (deterministicAccum_ && numL_ > 0)
+			{
+				d_Hll_int_.resize(static_cast<size_t>(d_Hll_.elemSize()));
+				d_bl_int_.resize(static_cast<size_t>(d_bl_.elemSize()));
+			}
 		}
 
 		if (optimizeP_ && optimizeL_)
@@ -797,11 +807,29 @@ public:
 				d_bp_int_ext_ptr = d_bp_int_ext_.data();
 			}
 
+			// Phase 3c: deterministic Hll[iL] + bl[iL] accumulation. Gated by
+			// deterministicAccum_ && optimizeL_ && numL_>0 — this is independent
+			// of extJoint_ because every edge accumulates into landmark slots.
+			// Zero the int64 mirrors, forward the raw pointers to the kernels,
+			// and after both 2D/3D calls convert the [0, numL) range back into
+			// d_Hll_ / d_bl_. When the flag is off the legacy atomicAdd(double)
+			// path is used and this block is a no-op.
+			const bool useDetAccumL = deterministicAccum_ && optimizeL_ && numL_ > 0;
+			long long* d_Hll_int_ptr = nullptr;
+			long long* d_bl_int_ptr = nullptr;
+			if (useDetAccumL)
+			{
+				d_Hll_int_.fillZero();
+				d_bl_int_.fillZero();
+				d_Hll_int_ptr = d_Hll_int_.data();
+				d_bl_int_ptr = d_bl_int_.data();
+			}
+
 			gpu::constructQuadraticForm(d_Xcs2D_, d_qs_, d_cameras_, d_errors2D_, d_omegas2D_, d_edge2PL2D_,
-				d_edge2Hpl2D_, d_edge2HplExt2D_, d_edge2ExtIP2D_, d_edge2HscPE2D_, d_edgeFlags2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, kernels_[0], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_, d_Hpp_int_ext_ptr, d_bp_int_ext_ptr);
+				d_edge2Hpl2D_, d_edge2HplExt2D_, d_edge2ExtIP2D_, d_edge2HscPE2D_, d_edgeFlags2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, kernels_[0], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_, d_Hpp_int_ext_ptr, d_bp_int_ext_ptr, d_Hll_int_ptr, d_bl_int_ptr);
 
 			gpu::constructQuadraticForm(d_Xcs3D_, d_qs_, d_cameras_, d_errors3D_, d_omegas3D_, d_edge2PL3D_,
-				d_edge2Hpl3D_, d_edge2HplExt3D_, d_edge2ExtIP3D_, d_edge2HscPE3D_, d_edgeFlags3D_, d_q_exts_3D_, d_t_exts_3D_, kernels_[1], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_, d_Hpp_int_ext_ptr, d_bp_int_ext_ptr);
+				d_edge2Hpl3D_, d_edge2HplExt3D_, d_edge2ExtIP3D_, d_edge2HscPE3D_, d_edgeFlags3D_, d_q_exts_3D_, d_t_exts_3D_, kernels_[1], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_, d_Hpp_int_ext_ptr, d_bp_int_ext_ptr, d_Hll_int_ptr, d_bl_int_ptr);
 
 			if (useDetAccum)
 			{
@@ -815,6 +843,15 @@ public:
 				gpu::convertFixedPointBpBodyRange(d_bp_int_ext_ptr, d_bp_, numBody_);
 				gpu::convertFixedPointHppExtRange(d_Hpp_int_ext_ptr, d_Hpp_, numBody_, numExt_);
 				gpu::convertFixedPointBpExtRange(d_bp_int_ext_ptr, d_bp_, numBody_, numExt_);
+			}
+			if (useDetAccumL)
+			{
+				// Phase 3c: propagate landmark-range slots [0, numL) back into
+				// the double Hll / bl buffers. Kept independent of useDetAccum
+				// above so landmark determinism can engage even when joint ext
+				// optimization is disabled.
+				gpu::convertFixedPointHllRange(d_Hll_int_ptr, d_Hll_, numL_);
+				gpu::convertFixedPointBlRange(d_bl_int_ptr, d_bl_, numL_);
 			}
 
 		const auto t1 = get_time_point();
@@ -1149,6 +1186,11 @@ private:
 	// deterministicAccum_ && extJoint_ && numExt_>0. Size == d_Hpp_.elemSize().
 	DeviceBuffer<long long> d_Hpp_int_ext_;
 	GpuLxLBlockVec d_Hll_;
+	// Option 4 Phase 3c: fixed-point int64 mirror of d_Hll_.values() used for
+	// deterministic atomicAdd on the landmark Hessian blocks. Allocated only
+	// when deterministicAccum_ && optimizeL_ && numL_>0. Size ==
+	// d_Hll_.elemSize() (numL_ * LDIM * LDIM).
+	DeviceBuffer<long long> d_Hll_int_;
 	GpuHplBlockMat d_Hpl_;
 	GpuVec3i d_HplBlockPos_;
 	GpuVec1d d_b_;
@@ -1159,6 +1201,11 @@ private:
 	// d_bp_.elemSize().
 	DeviceBuffer<long long> d_bp_int_ext_;
 	GpuLx1BlockVec d_bl_;
+	// Option 4 Phase 3c: fixed-point int64 mirror of d_bl_.values() used for
+	// deterministic atomicAdd on the landmark gradient vector. Allocated only
+	// when deterministicAccum_ && optimizeL_ && numL_>0. Size ==
+	// d_bl_.elemSize() (numL_ * LDIM).
+	DeviceBuffer<long long> d_bl_int_;
 	GpuPx1BlockVec d_HppBackup_;
 	GpuLx1BlockVec d_HllBackup_;
 

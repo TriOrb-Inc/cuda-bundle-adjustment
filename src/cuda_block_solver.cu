@@ -1067,20 +1067,22 @@ __global__ void constructQuadraticFormKernel(int nedges, const Vec3d* Xcs, const
 	PxPBlockPtr Hpp, Px1BlockPtr bp, LxLBlockPtr Hll, Lx1BlockPtr bl, PxLBlockPtr Hpl, PxPBlockPtr HscDirect,
 	const Vec4d* q_exts, const Vec3d* t_exts, const Vec4d* distortions,
 	// Option 4 Phase 2+: when non-null, the kernel routes the body/ext
-	// accumulations for `Hpp` and `bp` into these fixed-point int64 mirror
-	// buffers instead of the double buffers, so the final values are
-	// bit-identical across runs for the covered slots.
+	// accumulations for `Hpp`, `bp`, `Hll`, and `bl` into these fixed-point
+	// int64 mirror buffers instead of the double buffers, so the final
+	// values are bit-identical across runs for the covered slots.
 	//   Phase 2 : `Hpp.at(iPExt)`         — ext-range slot in [numBody, numBody+numExt).
 	//   Phase 3a: `bp.at(iPExt)`          — same iPExt slot (PDIM scalars).
 	//   Phase 3b: `Hpp.at(iP)` / `bp.at(iP)` — body-range slots in [0, numBody).
-	// After the kernel, the caller propagates the full [0, numBody+numExt)
-	// range back to the double buffers via `convertFixedPointHppBodyRange` +
-	// `convertFixedPointHppExtRange` (and the matching bp helpers). Remaining
-	// legacy atomic sites (`Hll`, `bl`, `HscDirect`, `Hpl.at(hplExtSlot)`,
+	//   Phase 3c: `Hll.at(iL)` / `bl.at(iL)` — landmark-range slots in [0, numL).
+	// After the kernel, the caller propagates the covered ranges back to the
+	// double buffers via the matching `convertFixedPoint*Range` helpers.
+	// Remaining legacy atomic sites (`HscDirect`, `Hpl.at(hplExtSlot)`,
 	// Schur update) continue to use `atomicAdd(double*)` and will be migrated
-	// in Phase 3c+.
+	// in Phase 3d+.
 	long long* Hpp_int_ext_raw = nullptr,
-	long long* bp_int_ext_raw = nullptr)
+	long long* bp_int_ext_raw = nullptr,
+	long long* Hll_int_raw = nullptr,
+	long long* bl_int_raw = nullptr)
 {
 	using Vecmd = Vecxd<MDIM>;
 
@@ -1170,11 +1172,32 @@ __global__ void constructQuadraticFormKernel(int nedges, const Vec3d* Xcs, const
 	}
 	if (!(flag & EDGE_FLAG_FIXED_L))
 	{
-		// Hll += = JLT*Omega*JL
-		MatTMulMat<LDIM, MDIM, LDIM, ACCUM_ATOMIC>(JL, JL, Hll.at(iL), omega);
-
-		// bl += = JLT*Omega*r
-		MatTMulVec<LDIM, MDIM, ACCUM_ATOMIC>(JL, error.data, bl.at(iL), omega);
+		// Option 4 Phase 3c: deterministic landmark-range Hll[iL] + bl[iL].
+		// Edge-to-landmark fanout is typically the highest in BA (each edge
+		// writes to exactly one iL), so this site has historically been a
+		// dominant source of atomicAdd non-determinism. LDIM=3, so
+		// MatTMulMatDet<3, MDIM, 3> and MatTMulVecDet<3, MDIM> instantiate
+		// cleanly from the existing primitives.
+		if (Hll_int_raw != nullptr)
+		{
+			MatTMulMatDet<LDIM, MDIM, LDIM>(JL, JL,
+				Hll_int_raw + iL * LDIM * LDIM, omega);
+		}
+		else
+		{
+			// Hll += = JLT*Omega*JL
+			MatTMulMat<LDIM, MDIM, LDIM, ACCUM_ATOMIC>(JL, JL, Hll.at(iL), omega);
+		}
+		if (bl_int_raw != nullptr)
+		{
+			MatTMulVecDet<LDIM, MDIM>(JL, error.data,
+				bl_int_raw + iL * LDIM, omega);
+		}
+		else
+		{
+			// bl += = JLT*Omega*r
+			MatTMulVec<LDIM, MDIM, ACCUM_ATOMIC>(JL, error.data, bl.at(iL), omega);
+		}
 	}
 	if (!(flag & (EDGE_FLAG_FIXED_P | EDGE_FLAG_FIXED_L)))
 	{
@@ -1913,7 +1936,9 @@ void constructQuadraticForm_(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuV
 	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuHplBlockMat& Hpl,
 	GpuHscBlockMat& HscDirect,
 	long long* Hpp_int_ext_raw,
-	long long* bp_int_ext_raw)
+	long long* bp_int_ext_raw,
+	long long* Hll_int_raw,
+	long long* bl_int_raw)
 {
 	const auto& errors = _errors.getRef<Vecxd<MDIM>>();
 	const RobustKernelFunc<RK_TYPE> robustKernel(robustDelta);
@@ -1931,7 +1956,7 @@ void constructQuadraticForm_(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuV
 
 	constructQuadraticFormKernel<MDIM, RK_TYPE><<<grid, block>>>(nedges, Xcs, qs, cameras, errors, omegas,
 		edge2PL, edge2Hpl, edge2HplExt, edge2ExtIP, edge2HscPE, flags, robustKernel, Hpp, bp, Hll, bl, Hpl, HscDirect,
-		q_exts, t_exts, d_dist_ptr, Hpp_int_ext_raw, bp_int_ext_raw);
+		q_exts, t_exts, d_dist_ptr, Hpp_int_ext_raw, bp_int_ext_raw, Hll_int_raw, bl_int_raw);
 	CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1939,7 +1964,7 @@ using ConstructQuadraticFormFunc = void(*)(const GpuVec3d&, const GpuVec4d&, con
 	const GpuVec1d&, const GpuVec2i&, const GpuVec1i&, const GpuVec1i&, const GpuVec1i&, const GpuVec1i&, const GpuVec1b&,
 	const GpuVec4d&, const GpuVec3d&, const GpuVec4d&, Scalar,
 	GpuPxPBlockVec&, GpuPx1BlockVec&, GpuLxLBlockVec&, GpuLx1BlockVec&, GpuHplBlockMat&, GpuHscBlockMat&,
-	long long*, long long*);
+	long long*, long long*, long long*, long long*);
 
 static ConstructQuadraticFormFunc constructQuadraticFormFuncs[6] =
 {
@@ -1959,10 +1984,12 @@ void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVe
 	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuHplBlockMat& Hpl,
 	GpuHscBlockMat& HscDirect,
 	long long* Hpp_int_ext_raw,
-	long long* bp_int_ext_raw)
+	long long* bp_int_ext_raw,
+	long long* Hll_int_raw,
+	long long* bl_int_raw)
 {
 	auto func = constructQuadraticFormFuncs[0 + kernel.type];
-	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, edge2HplExt, edge2ExtIP, edge2HscPE, flags, q_exts, t_exts, distortions, kernel.delta, Hpp, bp, Hll, bl, Hpl, HscDirect, Hpp_int_ext_raw, bp_int_ext_raw);
+	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, edge2HplExt, edge2ExtIP, edge2HscPE, flags, q_exts, t_exts, distortions, kernel.delta, Hpp, bp, Hll, bl, Hpl, HscDirect, Hpp_int_ext_raw, bp_int_ext_raw, Hll_int_raw, bl_int_raw);
 }
 
 void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVec5d& cameras, const GpuVec3d& errors,
@@ -1973,12 +2000,14 @@ void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVe
 	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuHplBlockMat& Hpl,
 	GpuHscBlockMat& HscDirect,
 	long long* Hpp_int_ext_raw,
-	long long* bp_int_ext_raw)
+	long long* bp_int_ext_raw,
+	long long* Hll_int_raw,
+	long long* bl_int_raw)
 {
 	// 3D (stereo) path: no distortion support, pass empty GpuVec4d
 	static GpuVec4d empty_distortions;
 	auto func = constructQuadraticFormFuncs[3 + kernel.type];
-	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, edge2HplExt, edge2ExtIP, edge2HscPE, flags, q_exts, t_exts, empty_distortions, kernel.delta, Hpp, bp, Hll, bl, Hpl, HscDirect, Hpp_int_ext_raw, bp_int_ext_raw);
+	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, edge2HplExt, edge2ExtIP, edge2HscPE, flags, q_exts, t_exts, empty_distortions, kernel.delta, Hpp, bp, Hll, bl, Hpl, HscDirect, Hpp_int_ext_raw, bp_int_ext_raw, Hll_int_raw, bl_int_raw);
 }
 
 template <int MDIM>
@@ -2297,6 +2326,45 @@ void convertFixedPointBpBodyRange(const long long* src_int,
 	const int grid = divUp(n, block);
 	deterministic::fixedPointToDoubleKernel<<<grid, block>>>(
 		n, src_int, bp.values());
+	CUDA_CHECK(cudaGetLastError());
+}
+
+// Option 4 Phase 3c: copy the full landmark-range slots of a fixed-point int64
+// buffer into the double `Hll` buffer. Each slot spans `LDIM * LDIM` scalars,
+// so the element range is `[0, numL * LDIM * LDIM)`. `src_int` must be sized
+// identically to `Hll.values()` and zeroed prior to accumulation; the double
+// slots must not have been written directly during accumulation (kernel
+// branches to int64 when pointer is non-null).
+void convertFixedPointHllRange(const long long* src_int,
+	GpuLxLBlockVec& Hll, int numL)
+{
+	if (numL <= 0 || src_int == nullptr)
+		return;
+	prepareCudaThreadContext();
+	constexpr int BLOCK_AREA = LDIM * LDIM;
+	const int n = numL * BLOCK_AREA;
+	const int block = 256;
+	const int grid = divUp(n, block);
+	deterministic::fixedPointToDoubleKernel<<<grid, block>>>(
+		n, src_int, Hll.values());
+	CUDA_CHECK(cudaGetLastError());
+}
+
+// Option 4 Phase 3c: copy the full landmark-range slots of a fixed-point int64
+// buffer into the double `bl` buffer. Each slot spans `LDIM` scalars, so the
+// element range is `[0, numL * LDIM)`. Mirrors `convertFixedPointHllRange`.
+void convertFixedPointBlRange(const long long* src_int,
+	GpuLx1BlockVec& bl, int numL)
+{
+	if (numL <= 0 || src_int == nullptr)
+		return;
+	prepareCudaThreadContext();
+	constexpr int BLOCK_SIZE = LDIM;
+	const int n = numL * BLOCK_SIZE;
+	const int block = 256;
+	const int grid = divUp(n, block);
+	deterministic::fixedPointToDoubleKernel<<<grid, block>>>(
+		n, src_int, bl.values());
 	CUDA_CHECK(cudaGetLastError());
 }
 
