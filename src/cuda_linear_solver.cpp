@@ -96,8 +96,21 @@ OrderingMethod resolve_ordering_method()
 	// deterministic BA, fall back to `symrcm`, which is a deterministic
 	// graph ordering (reverse Cuthill–McKee). Callers can still opt back
 	// into METIS by setting `TRIORB_CUDA_BA_ORDERING=metis` explicitly.
+	//
+	// Post-Phase-5 default flip: `TRIORB_CUDA_BA_DETERMINISTIC_ACCUM` is ON
+	// by default, so the absence of the env var maps to deterministic mode.
+	// Only an explicit opt-out (`0`/`false`/`no`/`off`) re-enables METIS.
 	const char* env_det_accum = std::getenv("TRIORB_CUDA_BA_DETERMINISTIC_ACCUM");
-	if (env_det_accum != nullptr && std::string(env_det_accum) == "1")
+	bool deterministic = true;
+	if (env_det_accum != nullptr)
+	{
+		std::string value(env_det_accum);
+		for (char& ch : value)
+			ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+		if (value == "0" || value == "false" || value == "no" || value == "off")
+			deterministic = false;
+	}
+	if (deterministic)
 	{
 		return OrderingMethod::kSymRcm;
 	}
