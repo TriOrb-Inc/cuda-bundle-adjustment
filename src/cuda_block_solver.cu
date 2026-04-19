@@ -1078,15 +1078,22 @@ __global__ void constructQuadraticFormKernel(int nedges, const Vec3d* Xcs, const
 	//   Phase 3d: `HscDirect.at(hscPESlot)` — direct body×ext Hsc cross blocks
 	//             (PDIM×PDIM). Layout matches `HscDirect.values()`; slot
 	//             indexing is dense across `d_HscDirect_.nnz()` blocks.
+	//   Phase 3e: `Hpl.at(hplExtSlot)` — ext×landmark Hpl cross blocks
+	//             (PDIM×LDIM). Layout matches `Hpl.values()` (stride
+	//             `PDIM*LDIM` per nnz slot). Only ext-range slots are written
+	//             via atomic accumulation; body Hpl slots use ASSIGN and are
+	//             not touched by the int64 path. The converter only propagates
+	//             the ext-dedup slots back to `Hpl.values()`.
 	// After the kernel, the caller propagates the covered ranges back to the
 	// double buffers via the matching `convertFixedPoint*Range` helpers.
-	// Remaining legacy atomic sites (`Hpl.at(hplExtSlot)`, Schur update)
-	// continue to use `atomicAdd(double*)` and will be migrated in Phase 3e+.
+	// Remaining legacy atomic sites (Schur update) continue to use
+	// `atomicAdd(double*)` and will be migrated in Phase 3f+.
 	long long* Hpp_int_ext_raw = nullptr,
 	long long* bp_int_ext_raw = nullptr,
 	long long* Hll_int_raw = nullptr,
 	long long* bl_int_raw = nullptr,
-	long long* HscDirect_int_raw = nullptr)
+	long long* HscDirect_int_raw = nullptr,
+	long long* Hpl_ext_int_raw = nullptr)
 {
 	using Vecmd = Vecxd<MDIM>;
 
@@ -1375,8 +1382,26 @@ __global__ void constructQuadraticFormKernel(int nedges, const Vec3d* Xcs, const
 			}
 			if (hplExtSlot >= 0 && !(flag & EDGE_FLAG_FIXED_L))
 			{
-				// Multiple edges may share the same (iP_ext, iL) Hpl slot; atomic accumulate.
-				MatTMulMat<PDIM, MDIM, LDIM, ACCUM_ATOMIC>(JE, JL, Hpl.at(hplExtSlot), omega);
+				// Multiple edges may share the same (iP_ext, iL) Hpl slot.
+				// Option 4 Phase 3e: route this accumulation through the int64
+				// fixed-point path when `Hpl_ext_int_raw` is non-null. The
+				// mirror buffer shares the full `Hpl.values()` layout
+				// (`nnz * PDIM * LDIM` scalars) so `hplExtSlot * PDIM * LDIM`
+				// gives the slot offset. Body Hpl slots are handled by the
+				// ASSIGN branch above and are never touched through this
+				// pointer. The caller invokes
+				// `convertFixedPointHplExtSlots()` after the accumulation
+				// kernel to write only the ext dedup slots back to the
+				// double `Hpl` buffer, leaving body ASSIGN values intact.
+				if (Hpl_ext_int_raw != nullptr)
+				{
+					MatTMulMatDet<PDIM, MDIM, LDIM>(JE, JL,
+						Hpl_ext_int_raw + hplExtSlot * (PDIM * LDIM), omega);
+				}
+				else
+				{
+					MatTMulMat<PDIM, MDIM, LDIM, ACCUM_ATOMIC>(JE, JL, Hpl.at(hplExtSlot), omega);
+				}
 			}
 	}
 }
@@ -1958,7 +1983,8 @@ void constructQuadraticForm_(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuV
 	long long* bp_int_ext_raw,
 	long long* Hll_int_raw,
 	long long* bl_int_raw,
-	long long* HscDirect_int_raw)
+	long long* HscDirect_int_raw,
+	long long* Hpl_ext_int_raw)
 {
 	const auto& errors = _errors.getRef<Vecxd<MDIM>>();
 	const RobustKernelFunc<RK_TYPE> robustKernel(robustDelta);
@@ -1976,7 +2002,7 @@ void constructQuadraticForm_(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuV
 
 	constructQuadraticFormKernel<MDIM, RK_TYPE><<<grid, block>>>(nedges, Xcs, qs, cameras, errors, omegas,
 		edge2PL, edge2Hpl, edge2HplExt, edge2ExtIP, edge2HscPE, flags, robustKernel, Hpp, bp, Hll, bl, Hpl, HscDirect,
-		q_exts, t_exts, d_dist_ptr, Hpp_int_ext_raw, bp_int_ext_raw, Hll_int_raw, bl_int_raw, HscDirect_int_raw);
+		q_exts, t_exts, d_dist_ptr, Hpp_int_ext_raw, bp_int_ext_raw, Hll_int_raw, bl_int_raw, HscDirect_int_raw, Hpl_ext_int_raw);
 	CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1984,7 +2010,7 @@ using ConstructQuadraticFormFunc = void(*)(const GpuVec3d&, const GpuVec4d&, con
 	const GpuVec1d&, const GpuVec2i&, const GpuVec1i&, const GpuVec1i&, const GpuVec1i&, const GpuVec1i&, const GpuVec1b&,
 	const GpuVec4d&, const GpuVec3d&, const GpuVec4d&, Scalar,
 	GpuPxPBlockVec&, GpuPx1BlockVec&, GpuLxLBlockVec&, GpuLx1BlockVec&, GpuHplBlockMat&, GpuHscBlockMat&,
-	long long*, long long*, long long*, long long*, long long*);
+	long long*, long long*, long long*, long long*, long long*, long long*);
 
 static ConstructQuadraticFormFunc constructQuadraticFormFuncs[6] =
 {
@@ -2007,10 +2033,11 @@ void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVe
 	long long* bp_int_ext_raw,
 	long long* Hll_int_raw,
 	long long* bl_int_raw,
-	long long* HscDirect_int_raw)
+	long long* HscDirect_int_raw,
+	long long* Hpl_ext_int_raw)
 {
 	auto func = constructQuadraticFormFuncs[0 + kernel.type];
-	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, edge2HplExt, edge2ExtIP, edge2HscPE, flags, q_exts, t_exts, distortions, kernel.delta, Hpp, bp, Hll, bl, Hpl, HscDirect, Hpp_int_ext_raw, bp_int_ext_raw, Hll_int_raw, bl_int_raw, HscDirect_int_raw);
+	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, edge2HplExt, edge2ExtIP, edge2HscPE, flags, q_exts, t_exts, distortions, kernel.delta, Hpp, bp, Hll, bl, Hpl, HscDirect, Hpp_int_ext_raw, bp_int_ext_raw, Hll_int_raw, bl_int_raw, HscDirect_int_raw, Hpl_ext_int_raw);
 }
 
 void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVec5d& cameras, const GpuVec3d& errors,
@@ -2024,12 +2051,13 @@ void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVe
 	long long* bp_int_ext_raw,
 	long long* Hll_int_raw,
 	long long* bl_int_raw,
-	long long* HscDirect_int_raw)
+	long long* HscDirect_int_raw,
+	long long* Hpl_ext_int_raw)
 {
 	// 3D (stereo) path: no distortion support, pass empty GpuVec4d
 	static GpuVec4d empty_distortions;
 	auto func = constructQuadraticFormFuncs[3 + kernel.type];
-	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, edge2HplExt, edge2ExtIP, edge2HscPE, flags, q_exts, t_exts, empty_distortions, kernel.delta, Hpp, bp, Hll, bl, Hpl, HscDirect, Hpp_int_ext_raw, bp_int_ext_raw, Hll_int_raw, bl_int_raw, HscDirect_int_raw);
+	func(Xcs, qs, cameras, errors, omegas, edge2PL, edge2Hpl, edge2HplExt, edge2ExtIP, edge2HscPE, flags, q_exts, t_exts, empty_distortions, kernel.delta, Hpp, bp, Hll, bl, Hpl, HscDirect, Hpp_int_ext_raw, bp_int_ext_raw, Hll_int_raw, bl_int_raw, HscDirect_int_raw, Hpl_ext_int_raw);
 }
 
 template <int MDIM>
@@ -2408,6 +2436,49 @@ void convertFixedPointHscDirect(const long long* src_int,
 	const int grid = divUp(n, block);
 	deterministic::fixedPointToDoubleKernel<<<grid, block>>>(
 		n, src_int, HscDirect.values());
+	CUDA_CHECK(cudaGetLastError());
+}
+
+// Option 4 Phase 3e: per-slot conversion for the ext-range portion of `Hpl`.
+// `Hpl` is a mixed-mode sparse block matrix: body edges write their unique
+// slot via `ASSIGN` (no atomic), while ext dedup slots accumulate via atomic
+// add from multiple edges. The deterministic path moves only the ext
+// accumulations into an int64 mirror (`src_int`, sized identically to
+// `Hpl.values()`, i.e. `nnz * PDIM * LDIM` scalars). After accumulation we
+// must only copy back the ext dedup slots — copying the full nnz range would
+// clobber the body ASSIGN values with the (zero) int64 content.
+//
+// `extSlotGlobalIds` is a device pointer to `nExtDedupSlots` int32 values,
+// each giving the global nnz slot index (into `Hpl`) for the ext dedup slot
+// at that position. This matches `d_edge2Hpl_.data() + nedges_total` in the
+// `CudaBlockSolver` bookkeeping.
+__global__ void fixedPointToDoubleHplExtSlotsKernel(
+	int nExtSlots, int scalarsPerSlot,
+	const int* extSlotGlobalIds,
+	const long long* src_int, Scalar* dst_double)
+{
+	const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+	const int total = nExtSlots * scalarsPerSlot;
+	if (tid >= total) return;
+	const int extIdx = tid / scalarsPerSlot;
+	const int scalarOffset = tid % scalarsPerSlot;
+	const int globalSlot = extSlotGlobalIds[extIdx];
+	const int idx = globalSlot * scalarsPerSlot + scalarOffset;
+	dst_double[idx] = deterministic::fromFixedPoint(src_int[idx]);
+}
+
+void convertFixedPointHplExtSlots(const long long* src_int,
+	GpuHplBlockMat& Hpl, const int* extSlotGlobalIds, int nExtDedupSlots)
+{
+	if (nExtDedupSlots <= 0 || src_int == nullptr || extSlotGlobalIds == nullptr)
+		return;
+	prepareCudaThreadContext();
+	constexpr int BLOCK_AREA = PDIM * LDIM;
+	const int n = nExtDedupSlots * BLOCK_AREA;
+	const int block = 256;
+	const int grid = divUp(n, block);
+	fixedPointToDoubleHplExtSlotsKernel<<<grid, block>>>(
+		nExtDedupSlots, BLOCK_AREA, extSlotGlobalIds, src_int, Hpl.values());
 	CUDA_CHECK(cudaGetLastError());
 }
 

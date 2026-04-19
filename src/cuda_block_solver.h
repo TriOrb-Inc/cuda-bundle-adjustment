@@ -59,9 +59,11 @@ Scalar computeActiveErrors(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5
 // `bp_int_ext_raw`; Phase 3b adds body-range conversion through the same
 // `Hpp_int_ext_raw` / `bp_int_ext_raw` buffers; Phase 3c adds
 // `Hll_int_raw` / `bl_int_raw` for the full landmark range; Phase 3d adds
-// `HscDirect_int_raw` for the direct body×ext Schur cross-block. Remaining
-// atomic sites (`Hpl.at(hplExtSlot)`, Schur update) will be migrated in
-// Phase 3e+.
+// `HscDirect_int_raw` for the direct body×ext Schur cross-block; Phase 3e
+// adds `Hpl_ext_int_raw` for the ext-range slots of the cross-block `Hpl`
+// (body slots still use ASSIGN and are not affected by this pointer).
+// Remaining atomic sites (Schur complement update in `computeHschureKernel`)
+// will be migrated in Phase 3f+.
 void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVec5d& cameras, const GpuVec2d& errors,
 	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1i& edge2HplExt,
 	const GpuVec1i& edge2ExtIP, const GpuVec1i& edge2HscPE, const GpuVec1b& flags,
@@ -73,7 +75,8 @@ void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVe
 	long long* bp_int_ext_raw = nullptr,
 	long long* Hll_int_raw = nullptr,
 	long long* bl_int_raw = nullptr,
-	long long* HscDirect_int_raw = nullptr);
+	long long* HscDirect_int_raw = nullptr,
+	long long* Hpl_ext_int_raw = nullptr);
 
 void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVec5d& cameras, const GpuVec3d& errors,
 	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1i& edge2HplExt,
@@ -86,7 +89,8 @@ void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVe
 	long long* bp_int_ext_raw = nullptr,
 	long long* Hll_int_raw = nullptr,
 	long long* bl_int_raw = nullptr,
-	long long* HscDirect_int_raw = nullptr);
+	long long* HscDirect_int_raw = nullptr,
+	long long* Hpl_ext_int_raw = nullptr);
 
 // Option 4 Phase 2: copy the ext-range slots of a fixed-point int64 buffer
 // (`src_int`, sized identically to `Hpp.values()`) into the corresponding
@@ -134,6 +138,19 @@ void convertFixedPointBlRange(const long long* src_int,
 // prior to `constructQuadraticForm`.
 void convertFixedPointHscDirect(const long long* src_int,
 	GpuHscBlockMat& HscDirect, int nnz);
+
+// Option 4 Phase 3e: copy only the ext-dedup slots of a fixed-point int64
+// buffer into the double `Hpl` block matrix. `src_int` is sized identically
+// to `Hpl.values()` (`nnz * PDIM * LDIM` scalars), but only the
+// `nExtDedupSlots` ext slots are written back. Body Hpl slots receive their
+// values through the ASSIGN branch of `constructQuadraticFormKernel` and
+// MUST NOT be overwritten by this helper.
+//
+// `extSlotGlobalIds` points to `nExtDedupSlots` int32 values on device,
+// each giving the global nnz slot index into `Hpl` for the ext dedup slot.
+// In `CudaBlockSolver` this matches `d_edge2Hpl_.data() + nedges_total`.
+void convertFixedPointHplExtSlots(const long long* src_int,
+	GpuHplBlockMat& Hpl, const int* extSlotGlobalIds, int nExtDedupSlots);
 
 // Build per-edge ext Hpl slot vector. For each edge e:
 //   edge2HplExt[e] = (dedup_slot[e] < 0) ? -1 : edge2Hpl[nedges_total + dedup_slot[e]]

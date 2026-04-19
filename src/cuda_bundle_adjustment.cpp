@@ -608,6 +608,21 @@ public:
 					d_HscDirect_int_.resize(nHsc);
 				}
 
+				// Phase 3e: allocate fixed-point int64 mirror for d_Hpl_ when
+				// deterministic accumulation is active and the joint ext path
+				// has atomic-accumulated Hpl slots. The mirror shares the full
+				// `Hpl.values()` layout (nnz * PDIM * LDIM), but only the
+				// `nExtHplBlocks_` ext dedup slots are written — body slots
+				// use ASSIGN in the double buffer and are never touched via
+				// this int64 pointer. Sized from `d_Hpl_.nnz()` which was
+				// established by `resizeNonZeros(nHplBlocks_)` above.
+				if (deterministicAccum_ && extJoint_ && nExtHplBlocks_ > 0 && d_Hpl_.nnz() > 0)
+				{
+					const size_t nHpl = static_cast<size_t>(d_Hpl_.nnz()) *
+						static_cast<size_t>(PDIM) * static_cast<size_t>(LDIM);
+					d_Hpl_ext_int_.resize(nHpl);
+				}
+
 			d_HscCSR_.resize(Hsc_.nnzSymm());
 			d_BSR2CSR_.assign(Hsc_.nnzSymm(), (int*)Hsc_.BSR2CSR());
 
@@ -849,11 +864,27 @@ public:
 				d_HscDirect_int_ptr = d_HscDirect_int_.data();
 			}
 
+			// Phase 3e: deterministic Hpl[hplExtSlot] accumulation for the ext
+			// dedup slots of the cross-block Hpl. Gated by
+			// deterministicAccum_ && extJoint_ && nExtHplBlocks_>0 so body-only
+			// or decoupled runs continue to use the legacy atomic path. Body
+			// Hpl slots remain on the ASSIGN path in the double buffer and are
+			// not touched via the int64 mirror.
+			const bool useDetAccumHpl = deterministicAccum_ && extJoint_
+				&& nExtHplBlocks_ > 0 && d_Hpl_.nnz() > 0
+				&& d_Hpl_ext_int_.size() > 0;
+			long long* d_Hpl_ext_int_ptr = nullptr;
+			if (useDetAccumHpl)
+			{
+				d_Hpl_ext_int_.fillZero();
+				d_Hpl_ext_int_ptr = d_Hpl_ext_int_.data();
+			}
+
 			gpu::constructQuadraticForm(d_Xcs2D_, d_qs_, d_cameras_, d_errors2D_, d_omegas2D_, d_edge2PL2D_,
-				d_edge2Hpl2D_, d_edge2HplExt2D_, d_edge2ExtIP2D_, d_edge2HscPE2D_, d_edgeFlags2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, kernels_[0], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_, d_Hpp_int_ext_ptr, d_bp_int_ext_ptr, d_Hll_int_ptr, d_bl_int_ptr, d_HscDirect_int_ptr);
+				d_edge2Hpl2D_, d_edge2HplExt2D_, d_edge2ExtIP2D_, d_edge2HscPE2D_, d_edgeFlags2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, kernels_[0], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_, d_Hpp_int_ext_ptr, d_bp_int_ext_ptr, d_Hll_int_ptr, d_bl_int_ptr, d_HscDirect_int_ptr, d_Hpl_ext_int_ptr);
 
 			gpu::constructQuadraticForm(d_Xcs3D_, d_qs_, d_cameras_, d_errors3D_, d_omegas3D_, d_edge2PL3D_,
-				d_edge2Hpl3D_, d_edge2HplExt3D_, d_edge2ExtIP3D_, d_edge2HscPE3D_, d_edgeFlags3D_, d_q_exts_3D_, d_t_exts_3D_, kernels_[1], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_, d_Hpp_int_ext_ptr, d_bp_int_ext_ptr, d_Hll_int_ptr, d_bl_int_ptr, d_HscDirect_int_ptr);
+				d_edge2Hpl3D_, d_edge2HplExt3D_, d_edge2ExtIP3D_, d_edge2HscPE3D_, d_edgeFlags3D_, d_q_exts_3D_, d_t_exts_3D_, kernels_[1], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_, d_Hpp_int_ext_ptr, d_bp_int_ext_ptr, d_Hll_int_ptr, d_bl_int_ptr, d_HscDirect_int_ptr, d_Hpl_ext_int_ptr);
 
 			if (useDetAccum)
 			{
@@ -883,6 +914,19 @@ public:
 				// into double. HscDirect has no ASSIGN writes so the entire
 				// `[0, nnz * PDIM * PDIM)` range is converted.
 				gpu::convertFixedPointHscDirect(d_HscDirect_int_ptr, d_HscDirect_, d_HscDirect_.nnz());
+			}
+			if (useDetAccumHpl)
+			{
+				// Phase 3e: propagate only the ext dedup slots back into
+				// `d_Hpl_`. `d_edge2Hpl_` layout: first `nedges_total` entries
+				// are per-edge body slot positions (written with ASSIGN and
+				// already valid); the tail `nExtHplBlocks_` entries are the
+				// ext dedup slots' global nnz positions, which is exactly the
+				// index mapping the conversion kernel needs.
+				const int nedges_total = nedges2D_ + nedges3D_;
+				const int* extSlotGlobalIds = d_edge2Hpl_.data() + nedges_total;
+				gpu::convertFixedPointHplExtSlots(d_Hpl_ext_int_ptr, d_Hpl_,
+					extSlotGlobalIds, nExtHplBlocks_);
 			}
 
 		const auto t1 = get_time_point();
@@ -1223,6 +1267,14 @@ private:
 	// d_Hll_.elemSize() (numL_ * LDIM * LDIM).
 	DeviceBuffer<long long> d_Hll_int_;
 	GpuHplBlockMat d_Hpl_;
+	// Option 4 Phase 3e: fixed-point int64 mirror of d_Hpl_.values() used for
+	// deterministic atomicAdd on the ext-range slots of the cross-block Hpl
+	// (`hplExtSlot` writes in `constructQuadraticFormKernel`). Allocated only
+	// when deterministicAccum_ && extJoint_ && nExtHplBlocks_>0 &&
+	// d_Hpl_.nnz()>0. Size == d_Hpl_.nnz() * PDIM * LDIM. Body Hpl slots
+	// share the same buffer layout but remain untouched by the int64 path
+	// (they use ASSIGN in the double buffer).
+	DeviceBuffer<long long> d_Hpl_ext_int_;
 	GpuVec3i d_HplBlockPos_;
 	GpuVec1d d_b_;
 	GpuPx1BlockVec d_bp_;
