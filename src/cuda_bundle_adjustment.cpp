@@ -755,6 +755,11 @@ public:
 		d_distortions_2D_.assign(nedges2D_, distortions_.data());
 
 		d_chi_.resize(1);
+		// Option 4 Phase 3g: single-element int64 accumulator shared between
+		// computeErrors and computeScale. Same allocation gate as the other
+		// Phase 3 mirrors: only needed when the deterministic path is enabled.
+		if (deterministicAccum_)
+			d_chi_int_.resize(1);
 
 		d_chiSqs_.resize(baseEdges_.size());
 		d_chiSqs2D_.map(nedges2D_, d_chiSqs_.data());
@@ -787,11 +792,18 @@ public:
 		// qs_/ts_ slots so the projection kernel sees the current ext state.
 		syncExtSolutionToPerEdge();
 
+		// Option 4 Phase 3g: route the final chi2 reduction through the
+		// deterministic int64 accumulator when the flag is active. The 2D and
+		// 3D paths reuse the same single-element buffer; they run sequentially
+		// so no interference. Passing nullptr preserves the legacy double path.
+		long long* chi_int_ptr = deterministicAccum_ && d_chi_int_.size() > 0
+			? d_chi_int_.data() : nullptr;
+
 		const Scalar chi2D = gpu::computeActiveErrors(d_qs_, d_ts_, d_cameras_, d_Xws_, d_measurements2D_,
-			d_omegas2D_, d_edge2PL2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, kernels_[0], d_errors2D_, d_Xcs2D_, d_chi_);
+			d_omegas2D_, d_edge2PL2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, kernels_[0], d_errors2D_, d_Xcs2D_, d_chi_, chi_int_ptr);
 
 		const Scalar chi3D = gpu::computeActiveErrors(d_qs_, d_ts_, d_cameras_, d_Xws_, d_measurements3D_,
-			d_omegas3D_, d_edge2PL3D_, d_q_exts_3D_, d_t_exts_3D_, kernels_[1], d_errors3D_, d_Xcs3D_, d_chi_);
+			d_omegas3D_, d_edge2PL3D_, d_q_exts_3D_, d_t_exts_3D_, kernels_[1], d_errors3D_, d_Xcs3D_, d_chi_, chi_int_ptr);
 
 		const auto t1 = get_time_point();
 		profItems_[PROF_ITEM_COMPUTE_ERROR] += get_duration(t0, t1);
@@ -1101,10 +1113,13 @@ public:
 
 	double computeScale(double lambda)
 	{
-		gpu::computeScale(d_x_, d_b_, d_chi_, ScalarCast(lambda));
-		Scalar scale = 0;
-		d_chi_.download(&scale);
-		return scale;
+		// Option 4 Phase 3g: same int64 accumulator used for chi2 is reused for
+		// the LM denominator `x.(lambda*x + b)`. `gpu::computeScale` now returns
+		// the scalar directly (unified with `computeActiveErrors`'s signature)
+		// so there is no host-side `download` here anymore.
+		long long* scale_int_ptr = deterministicAccum_ && d_chi_int_.size() > 0
+			? d_chi_int_.data() : nullptr;
+		return gpu::computeScale(d_x_, d_b_, d_chi_, ScalarCast(lambda), scale_int_ptr);
 	}
 
 	void push()
@@ -1380,6 +1395,12 @@ private:
 
 	// temporary buffer
 	DeviceBuffer<Scalar> d_chi_;
+	// Option 4 Phase 3g: single-element int64 mirror of `d_chi_` used for the
+	// deterministic final reduction in `computeActiveErrorsKernel` and
+	// `computeScaleKernel`. Shared between the two call sites because they
+	// never overlap in time (computeErrors runs before computeScale each LM
+	// iteration). Allocated only when `deterministicAccum_` is active.
+	DeviceBuffer<long long> d_chi_int_;
 	GpuVec1i d_nnzPerCol_;
 
 	////////////////////////////////////////////////////////////////////////////////////

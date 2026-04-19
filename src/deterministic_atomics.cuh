@@ -116,7 +116,9 @@ toFixedPoint(Scalar value)
 #endif
 }
 
-__device__ __forceinline__ Scalar
+// Host+device accessible: Phase 3g reads per-iteration chi2 / scale scalars back
+// to the CPU before converting to double, so this helper must compile for both.
+__host__ __device__ __forceinline__ Scalar
 fromFixedPoint(long long q)
 {
 	return static_cast<Scalar>(q) * static_cast<Scalar>(FIXED_POINT_INV_SCALE);
