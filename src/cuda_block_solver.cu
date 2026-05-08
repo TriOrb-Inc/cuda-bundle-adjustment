@@ -1977,6 +1977,11 @@ void findHschureMulBlockIndices(const GpuHplBlockMat& Hpl, const GpuHscBlockMat&
 	GpuVec3i& mulBlockIds)
 {
 	prepareCudaThreadContext();
+	const int mulBlockCapacity = mulBlockIds.ssize();
+	if (Hpl.cols() <= 0 || mulBlockCapacity <= 0)
+	{
+		return;
+	}
 	const int block = 1024;
 	const int grid = divUp(Hpl.cols(), block);
 
@@ -1984,7 +1989,6 @@ void findHschureMulBlockIndices(const GpuHplBlockMat& Hpl, const GpuHscBlockMat&
 	nindices.fillZero();
 	DeviceBuffer<int> overflow(1);
 	overflow.fillZero();
-	const int mulBlockCapacity = mulBlockIds.ssize();
 
 	// Initialize every Vec3i slot to (-1, -1, -1) before the kernel populates a
 	// prefix of the buffer via atomicAdd(nindices, 1). The caller sizes the buffer
