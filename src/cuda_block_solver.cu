@@ -19,6 +19,8 @@ limitations under the License.
 #include <algorithm>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#include <stdexcept>
+#include <string>
 
 #include <thrust/device_ptr.h>
 #include <thrust/scan.h>
@@ -1632,7 +1634,8 @@ __global__ void computeHschureKernel(int size, const Vec3i* mulBlockIds,
 }
 
 __global__ void findHschureMulBlockIndicesKernel(int cols, const int* HplColPtr, const int* HplRowInd,
-	const int* HscRowPtr, const int* HscColInd, Vec3i* mulBlockIds, int* nindices)
+	const int* HscRowPtr, const int* HscColInd, Vec3i* mulBlockIds, int* nindices,
+	int mulBlockCapacity, int* overflow)
 {
 	const int colId = blockIdx.x * blockDim.x + threadIdx.x;
 	if (colId >= cols)
@@ -1659,12 +1662,26 @@ __global__ void findHschureMulBlockIndicesKernel(int cols, const int* HplColPtr,
 				// computeHschureKernel can skip this multiplication instead of
 				// scattering into an unrelated block.
 				const int pos = atomicAdd(nindices, 1);
-				mulBlockIds[pos] = makeVec3i(i, j, -1);
+				if (pos < mulBlockCapacity)
+				{
+					mulBlockIds[pos] = makeVec3i(i, j, -1);
+				}
+				else
+				{
+					atomicExch(overflow, 1);
+				}
 			}
 			else
 			{
 				const int pos = atomicAdd(nindices, 1);
-				mulBlockIds[pos] = makeVec3i(i, j, k);
+				if (pos < mulBlockCapacity)
+				{
+					mulBlockIds[pos] = makeVec3i(i, j, k);
+				}
+				else
+				{
+					atomicExch(overflow, 1);
+				}
 			}
 		}
 	}
@@ -1965,22 +1982,33 @@ void findHschureMulBlockIndices(const GpuHplBlockMat& Hpl, const GpuHscBlockMat&
 
 	DeviceBuffer<int> nindices(1);
 	nindices.fillZero();
+	DeviceBuffer<int> overflow(1);
+	overflow.fillZero();
+	const int mulBlockCapacity = mulBlockIds.ssize();
 
 	// Initialize every Vec3i slot to (-1, -1, -1) before the kernel populates a
-	// prefix of the buffer via atomicAdd(nindices, 1). The buffer is sized for
-	// the upper bound nmultiplies_ (including duplicate enumeration of indices in
-	// constructFromVertices), but the kernel only writes one slot per unique Hpl
-	// (iP1, iP2) pair for each landmark column, which is <= nmultiplies_. Joint
-	// ext mode makes this gap real: computeHschureKernel would otherwise scatter
-	// into random Hschur/Hpl blocks for the tail entries. Writing 0xFF bytes
-	// across the entire buffer sets each int to -1, which the sentinel check in
-	// computeHschureKernel (index[2] < 0) skips.
+	// prefix of the buffer via atomicAdd(nindices, 1). The caller sizes the buffer
+	// from the actual Hpl row-slot pair enumeration per landmark column, not from
+	// Hsc_.nmulBlocks(), because Hsc stores unique Schur row pairs while Hpl can
+	// contain duplicate row slots introduced by multi-camera / joint-ext edges.
+	// Writing 0xFF bytes across the entire buffer sets each int to -1, which the
+	// sentinel check in computeHschureKernel (index[2] < 0) skips.
 	CUDA_CHECK(cudaMemset(mulBlockIds.data(), 0xFF,
 		sizeof(Vec3i) * mulBlockIds.size()));
 
 	findHschureMulBlockIndicesKernel<<<grid, block>>>(Hpl.cols(), Hpl.outerIndices(), Hpl.innerIndices(),
-		Hsc.outerIndices(), Hsc.innerIndices(), mulBlockIds, nindices);
+		Hsc.outerIndices(), Hsc.innerIndices(), mulBlockIds, nindices, mulBlockCapacity, overflow);
 	CUDA_CHECK(cudaGetLastError());
+	int hostNindices = 0;
+	int hostOverflow = 0;
+	nindices.download(&hostNindices);
+	overflow.download(&hostOverflow);
+	if (hostOverflow != 0 || hostNindices > mulBlockCapacity)
+	{
+		throw std::runtime_error(
+			"findHschureMulBlockIndices overflow: writes=" + std::to_string(hostNindices) +
+			", capacity=" + std::to_string(mulBlockCapacity));
+	}
 
 	auto ptrSrc = thrust::device_pointer_cast(mulBlockIds.data());
 	// Option 4 Phase 5: stable sort so that mulBlockIds with identical (row, col)

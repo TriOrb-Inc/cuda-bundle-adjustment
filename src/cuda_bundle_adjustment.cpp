@@ -20,6 +20,8 @@ limitations under the License.
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -644,7 +646,12 @@ public:
 			d_HscCSR_.resize(Hsc_.nnzSymm());
 			d_BSR2CSR_.assign(Hsc_.nnzSymm(), (int*)Hsc_.BSR2CSR());
 
-			d_HscMulBlockIds_.resize(Hsc_.nmulBlocks());
+			const int hplPairCapacity = hplPairEnumerationUpperBound();
+			trace_cuda_ba(
+				"Hschur multiply slots: hsc_unique_pairs=" + std::to_string(Hsc_.nmulBlocks()) +
+				", hpl_pair_capacity=" + std::to_string(hplPairCapacity) +
+				", hpl_blocks=" + std::to_string(nHplBlocks_));
+			d_HscMulBlockIds_.resize(hplPairCapacity);
 			gpu::findHschureMulBlockIndices(d_Hpl_, d_Hsc_, d_HscMulBlockIds_);
 
 			d_bsc_.resize(numP_);
@@ -1221,6 +1228,36 @@ private:
 		if (fixedP) flag |= EDGE_FLAG_FIXED_P;
 		if (fixedL) flag |= EDGE_FLAG_FIXED_L;
 		return flag;
+	}
+
+	int hplPairEnumerationUpperBound() const
+	{
+		// Schur multiply index generation enumerates every Hpl row-slot pair per
+		// landmark column. This can exceed Hsc_.nmulBlocks(), which counts only
+		// unique Schur row pairs after host-side deduplication.
+		std::vector<int> entriesPerLandmark(static_cast<size_t>(std::max(numL_, 0)), 0);
+		for (const auto& blockPos : HplBlockPos_)
+		{
+			if (blockPos.col < 0 || blockPos.col >= numL_)
+			{
+				throw std::runtime_error(
+					"invalid Hpl block column: col=" + std::to_string(blockPos.col) +
+					", numL=" + std::to_string(numL_));
+			}
+			entriesPerLandmark[static_cast<size_t>(blockPos.col)]++;
+		}
+
+		size_t capacity = 0;
+		for (const int count : entriesPerLandmark)
+		{
+			const size_t n = static_cast<size_t>(count);
+			capacity += n * (n + 1U) / 2U;
+			if (capacity > static_cast<size_t>(std::numeric_limits<int>::max()))
+			{
+				throw std::runtime_error("Hpl pair enumeration exceeds int capacity");
+			}
+		}
+		return static_cast<int>(capacity);
 	}
 
 	////////////////////////////////////////////////////////////////////////////////////
