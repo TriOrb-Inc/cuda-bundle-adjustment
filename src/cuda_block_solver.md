@@ -28,6 +28,7 @@
 - stereo の 3 residual 版も同じ方針でそろえ、右画像の `bf` 項だけを別扱いした projection Jacobian を `J_pi_ext` 経由で伝播させます。
 - `computeHschure()` は毎回 `Hpp` で対角を上書きする前に `HscDirect` を device-to-device copy し、direct pose-ext block を保持したまま Schur complement を加算します。これにより ext を `verticesP_` へ昇格した joint pathでも `factorize failed` に落ちにくい正常な法方程式を構成します。
 - `findHschureMulBlockIndices()` は、呼び出し側で確保された `mulBlockIds` の容量を kernel へ渡し、overflow 時は範囲外書き込みではなく `std::runtime_error` で停止します。これは `TRIORB_DISABLE_LIDAR=1` の旧経路で point cloud が残存した際、`findHschureMulBlockIndicesKernel` が `mulBlockIds[pos]` へ範囲外書き込みしていた問題への直接対策です。
+- `buildHplStructure()` と `findHschureMulBlockIndices()` の sort comparator は、duplicate slot を含む Schur 構造を `(col,row,edgeId)` / `(row,col,hplPairSlot)` の total order で並べます。`stable_sort` だけに依存すると、atomic prefix や入力 edge 列の同値キー順が solver 内部の slot 配置へ残るため、deterministic accumulation を有効にしても Local BA / Full BA の更新が微小に分岐し得ます。
 
 ## 目標
 
@@ -35,6 +36,7 @@
 - CUDA kernel 自体の問題と、host 側 CUDA context の問題を切り分けやすくする。
 - per-edge extrinsics を持つ multi-camera BA でも、CPU 側実装と同じ Jacobian 定義で正しい update 方向を保つ。
 - LiDAR 無効化漏れや future の bad input が入っても、Schur multiply index の容量不整合を GPU memory corruption へ発展させず、診断可能な overflow failure として扱う。
+- deterministic accumulation と組み合わせたときに、duplicate Schur slot の列挙順や Thrust の同値キー処理へ依存しない kernel / solver レベルの再現性を保つ。
 
 ## 関連
 

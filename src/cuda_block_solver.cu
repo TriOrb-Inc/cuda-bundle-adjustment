@@ -70,7 +70,11 @@ struct LessRowId
 	__device__ bool operator()(const Vec3i& lhs, const Vec3i& rhs) const
 	{
 		if (lhs[0] == rhs[0])
+		{
+			if (lhs[1] == rhs[1])
+				return lhs[2] < rhs[2];
 			return lhs[1] < rhs[1];
+		}
 		return lhs[0] < rhs[0];
 	}
 };
@@ -80,7 +84,11 @@ struct LessColId
 	__device__ bool operator()(const Vec3i& lhs, const Vec3i& rhs) const
 	{
 		if (lhs[1] == rhs[1])
+		{
+			if (lhs[0] == rhs[0])
+				return lhs[2] < rhs[2];
 			return lhs[0] < rhs[0];
+		}
 		return lhs[1] < rhs[1];
 	}
 };
@@ -1956,15 +1964,10 @@ void buildHplStructure(GpuVec3i& blockpos, GpuHplBlockMat& Hpl, GpuVec1i& indexP
 	int* rowInd = Hpl.innerIndices();
 
 	auto ptrBlockPos = thrust::device_pointer_cast(blockpos.data());
-	// Option 4 Phase 5: `thrust::sort` is not stable. When multiple edges contribute
-	// to the same (row, col) Hpl block (e.g., a landmark observed by multiple cameras
-	// in the same pose), their edgeId tie-breaks after the primary (col, row) keys,
-	// and a non-stable sort may permute them across runs. That permutes
-	// `indexPL[edgeId] = k`, so the per-edge ASSIGN into `Hpl.at(edge2Hpl[iE])` routes
-	// each edge's Jacobian into a different block slot than the previous run. The
-	// downstream Schur complement still sums consistently, but the per-block memory
-	// layout and floating-point accumulation order through Hpl→Hschur flip between
-	// runs. Use `stable_sort` so the edge ordering is reproducible.
+	// Option 4 Phase 5: duplicate Hpl slots are valid when multiple edges contribute
+	// to the same (row, col) block. Sort by a total (col, row, edgeId) key so the
+	// per-edge `indexPL[edgeId] = k` mapping does not depend on Thrust's handling of
+	// equivalent keys or on the launch order that produced the block list.
 	thrust::stable_sort(ptrBlockPos, ptrBlockPos + nblocks, LessColId());
 
 	CUDA_CHECK(cudaMemset(nnzPerCol, 0, sizeof(int) * (Hpl.cols() + 1)));
@@ -2015,13 +2018,9 @@ void findHschureMulBlockIndices(const GpuHplBlockMat& Hpl, const GpuHscBlockMat&
 	}
 
 	auto ptrSrc = thrust::device_pointer_cast(mulBlockIds.data());
-	// Option 4 Phase 5: stable sort so that mulBlockIds with identical (row, col)
-	// keep their original order across runs. The slots with same (iP1, iP2) are
-	// consumed sequentially by computeHschureKernel, and a non-stable permutation
-	// of the consumption order affects the deterministic int64 accumulation
-	// pattern inside the Schur update (accumulation itself is deterministic, but
-	// downstream sentinel slot placement `(-1)` depends on the stable prefix
-	// written by findHschureMulBlockIndicesKernel via `atomicAdd(nindices, 1)`).
+	// Option 4 Phase 5: use a total (row, col, hplPairSlot) order. The kernel writes
+	// the prefix through atomicAdd(nindices, 1), so preserving equivalent-key prefix
+	// order is not sufficient for deterministic Schur construction.
 	thrust::stable_sort(ptrSrc, ptrSrc + mulBlockIds.size(), LessRowId());
 }
 
