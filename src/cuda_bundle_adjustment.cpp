@@ -20,6 +20,8 @@ limitations under the License.
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -78,8 +80,8 @@ static constexpr double kExtMaxRotationPerIter = 0.0017453292519943296;  // 0.1 
 using VertexMapP = std::map<int, VertexP*>;
 using VertexMapL = std::map<int, VertexL*>;
 using VertexMapE = std::map<int, ExtrinsicsVertex*>;
-using EdgeSet2D = std::unordered_set<Edge2D*>;
-using EdgeSet3D = std::unordered_set<Edge3D*>;
+using EdgeSet2D = std::vector<Edge2D*>;
+using EdgeSet3D = std::vector<Edge3D*>;
 using time_point = decltype(std::chrono::steady_clock::now());
 
 static inline time_point get_time_point()
@@ -167,7 +169,8 @@ public:
 		// Option 4 Phase 2: deterministic accumulation bookkeeping. The flag
 		// itself is owned by the solver via setDeterministicAccum() and is not
 		// reset here (callers toggle it before each optimize() call). The
-		// int64 mirror buffer is re-sized in buildStructure() to match d_Hpp_.
+		// pose int64 mirror buffers are re-sized in buildStructure() to match
+		// d_Hpp_ / d_bp_.
 	}
 
 	void initialize(const VertexMapP& vertexMapP, const VertexMapL& vertexMapL,
@@ -536,14 +539,15 @@ public:
 			d_HppBackup_.resize(numP_);
 		}
 
-		// Option 4 Phase 2+: when deterministic accumulation is enabled and the
-		// joint extrinsics path is active, allocate fixed-point int64 mirror
-		// buffers for d_Hpp_ (Phase 2) and d_bp_ (Phase 3a). The kernel routes
-		// ext-range atomicAdd writes into these buffers; the matching
-		// convertFixedPoint*ExtRange() helpers then propagate the ext slots
-		// back into the double buffers after each buildSystem(). Body-range
-		// slots remain zero and are never read back.
-		if (deterministicAccum_ && optimizeP_ && extJoint_ && numExt_ > 0)
+		// Option 4 Phase 2+: deterministic pose-block accumulation. Allocate
+		// fixed-point int64 mirror buffers for d_Hpp_ (Phase 2) and d_bp_
+		// (Phase 3a) whenever pose vertices are optimized. The kernel routes
+		// body-range writes into these buffers on every Local BA run; joint
+		// extrinsics, when enabled, reuse the same full-size mirror for the
+		// ext-range slots. The historical member names include "_ext_" because
+		// the buffers were first introduced for joint extrinsics, but they now
+		// cover all pose slots.
+		if (deterministicAccum_ && optimizeP_ && numP_ > 0)
 		{
 			d_Hpp_int_ext_.resize(static_cast<size_t>(d_Hpp_.elemSize()));
 			d_bp_int_ext_.resize(static_cast<size_t>(d_bp_.elemSize()));
@@ -644,7 +648,12 @@ public:
 			d_HscCSR_.resize(Hsc_.nnzSymm());
 			d_BSR2CSR_.assign(Hsc_.nnzSymm(), (int*)Hsc_.BSR2CSR());
 
-			d_HscMulBlockIds_.resize(Hsc_.nmulBlocks());
+			const int hplPairCapacity = hplPairEnumerationUpperBound();
+			trace_cuda_ba(
+				"Hschur multiply slots: hsc_unique_pairs=" + std::to_string(Hsc_.nmulBlocks()) +
+				", hpl_pair_capacity=" + std::to_string(hplPairCapacity) +
+				", hpl_blocks=" + std::to_string(nHplBlocks_));
+			d_HscMulBlockIds_.resize(hplPairCapacity);
 			gpu::findHschureMulBlockIndices(d_Hpl_, d_Hsc_, d_HscMulBlockIds_);
 
 			d_bsc_.resize(numP_);
@@ -755,6 +764,11 @@ public:
 		d_distortions_2D_.assign(nedges2D_, distortions_.data());
 
 		d_chi_.resize(1);
+		// Option 4 Phase 3g: single-element int64 accumulator shared between
+		// computeErrors and computeScale. Same allocation gate as the other
+		// Phase 3 mirrors: only needed when the deterministic path is enabled.
+		if (deterministicAccum_)
+			d_chi_int_.resize(1);
 
 		d_chiSqs_.resize(baseEdges_.size());
 		d_chiSqs2D_.map(nedges2D_, d_chiSqs_.data());
@@ -787,11 +801,18 @@ public:
 		// qs_/ts_ slots so the projection kernel sees the current ext state.
 		syncExtSolutionToPerEdge();
 
+		// Option 4 Phase 3g: route the final chi2 reduction through the
+		// deterministic int64 accumulator when the flag is active. The 2D and
+		// 3D paths reuse the same single-element buffer; they run sequentially
+		// so no interference. Passing nullptr preserves the legacy double path.
+		long long* chi_int_ptr = deterministicAccum_ && d_chi_int_.size() > 0
+			? d_chi_int_.data() : nullptr;
+
 		const Scalar chi2D = gpu::computeActiveErrors(d_qs_, d_ts_, d_cameras_, d_Xws_, d_measurements2D_,
-			d_omegas2D_, d_edge2PL2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, kernels_[0], d_errors2D_, d_Xcs2D_, d_chi_);
+			d_omegas2D_, d_edge2PL2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, kernels_[0], d_errors2D_, d_Xcs2D_, d_chi_, chi_int_ptr);
 
 		const Scalar chi3D = gpu::computeActiveErrors(d_qs_, d_ts_, d_cameras_, d_Xws_, d_measurements3D_,
-			d_omegas3D_, d_edge2PL3D_, d_q_exts_3D_, d_t_exts_3D_, kernels_[1], d_errors3D_, d_Xcs3D_, d_chi_);
+			d_omegas3D_, d_edge2PL3D_, d_q_exts_3D_, d_t_exts_3D_, kernels_[1], d_errors3D_, d_Xcs3D_, d_chi_, chi_int_ptr);
 
 		const auto t1 = get_time_point();
 		profItems_[PROF_ITEM_COMPUTE_ERROR] += get_duration(t0, t1);
@@ -834,18 +855,17 @@ public:
 				d_Hpl_.fillZero();
 			d_HscDirect_.fillZero();
 
-			// Option 4 Phase 2+: deterministic Hpp[iPExt] (Phase 2) and
-			// bp[iPExt] (Phase 3a) accumulation. When the flag is on and the
-			// joint path has unfixed ext vertices, we zero both int64 mirror
-			// buffers, pass their raw pointers to the kernels, and after both
-			// 2D/3D accumulate calls we convert the ext-range slots back into
-			// d_Hpp_ / d_bp_. When off, the legacy double atomicAdd path is
-			// used and this whole block is a no-op (nullptr is passed to the
-			// kernel).
-			const bool useDetAccum = deterministicAccum_ && extJoint_ && numExt_ > 0;
+			// Option 4 Phase 2+: deterministic Hpp[iP] (Phase 2) and bp[iP]
+			// (Phase 3a) accumulation for every optimized pose slot. This must
+			// not be gated by extJoint_: body-only Local BA otherwise falls back
+			// to atomicAdd(double*) and can produce run-to-run different LM
+			// steps. Joint ext slots share the same full-size mirror when they
+			// are present.
+			const bool useDetAccumP = deterministicAccum_ && optimizeP_ && numP_ > 0
+				&& d_Hpp_int_ext_.size() > 0 && d_bp_int_ext_.size() > 0;
 			long long* d_Hpp_int_ext_ptr = nullptr;
 			long long* d_bp_int_ext_ptr = nullptr;
-			if (useDetAccum)
+			if (useDetAccumP)
 			{
 				d_Hpp_int_ext_.fillZero();
 				d_bp_int_ext_.fillZero();
@@ -871,10 +891,11 @@ public:
 				d_bl_int_ptr = d_bl_int_.data();
 			}
 
-			// Phase 3d: deterministic HscDirect[hscPESlot] accumulation. Shares
-			// the ext-joint gate with Phase 2/3a/3b since HscDirect is only
-			// populated when joint extrinsics optimization is active.
-			const bool useDetAccumHsc = useDetAccum && d_HscDirect_.nnz() > 0;
+			// Phase 3d: deterministic HscDirect[hscPESlot] accumulation. This
+			// remains ext-joint specific because HscDirect is only populated
+			// when joint extrinsics optimization is active.
+			const bool useDetAccumHsc = deterministicAccum_ && extJoint_ && numExt_ > 0
+				&& d_HscDirect_.nnz() > 0 && d_HscDirect_int_.size() > 0;
 			long long* d_HscDirect_int_ptr = nullptr;
 			if (useDetAccumHsc)
 			{
@@ -904,14 +925,11 @@ public:
 			gpu::constructQuadraticForm(d_Xcs3D_, d_qs_, d_cameras_, d_errors3D_, d_omegas3D_, d_edge2PL3D_,
 				d_edge2Hpl3D_, d_edge2HplExt3D_, d_edge2ExtIP3D_, d_edge2HscPE3D_, d_edgeFlags3D_, d_q_exts_3D_, d_t_exts_3D_, kernels_[1], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_, d_Hpp_int_ext_ptr, d_bp_int_ext_ptr, d_Hll_int_ptr, d_bl_int_ptr, d_HscDirect_int_ptr, d_Hpl_ext_int_ptr);
 
-			if (useDetAccum)
+			if (useDetAccumP)
 			{
-				// Phase 3b: convert the body-range slots first (kernel writes
-				// body iP accumulations to [0, numBody) when the buffers are
-				// non-null). Phase 2/3a then propagates the ext-range slots
-				// [numBody, numBody+numExt). Together they cover the full
-				// [0, numBody+numExt) range and restore d_Hpp_ / d_bp_ to a
-				// consistent double view.
+				// Phase 3b: convert the body-range slots first. Joint ext slots
+				// are then converted separately; when extJoint_ is false numExt_
+				// is zero and these ext conversions are no-ops.
 				gpu::convertFixedPointHppBodyRange(d_Hpp_int_ext_ptr, d_Hpp_, numBody_);
 				gpu::convertFixedPointBpBodyRange(d_bp_int_ext_ptr, d_bp_, numBody_);
 				gpu::convertFixedPointHppExtRange(d_Hpp_int_ext_ptr, d_Hpp_, numBody_, numExt_);
@@ -1101,10 +1119,13 @@ public:
 
 	double computeScale(double lambda)
 	{
-		gpu::computeScale(d_x_, d_b_, d_chi_, ScalarCast(lambda));
-		Scalar scale = 0;
-		d_chi_.download(&scale);
-		return scale;
+		// Option 4 Phase 3g: same int64 accumulator used for chi2 is reused for
+		// the LM denominator `x.(lambda*x + b)`. `gpu::computeScale` now returns
+		// the scalar directly (unified with `computeActiveErrors`'s signature)
+		// so there is no host-side `download` here anymore.
+		long long* scale_int_ptr = deterministicAccum_ && d_chi_int_.size() > 0
+			? d_chi_int_.data() : nullptr;
+		return gpu::computeScale(d_x_, d_b_, d_chi_, ScalarCast(lambda), scale_int_ptr);
 	}
 
 	void push()
@@ -1208,6 +1229,36 @@ private:
 		return flag;
 	}
 
+	int hplPairEnumerationUpperBound() const
+	{
+		// Schur multiply index generation enumerates every Hpl row-slot pair per
+		// landmark column. This can exceed Hsc_.nmulBlocks(), which counts only
+		// unique Schur row pairs after host-side deduplication.
+		std::vector<int> entriesPerLandmark(static_cast<size_t>(std::max(numL_, 0)), 0);
+		for (const auto& blockPos : HplBlockPos_)
+		{
+			if (blockPos.col < 0 || blockPos.col >= numL_)
+			{
+				throw std::runtime_error(
+					"invalid Hpl block column: col=" + std::to_string(blockPos.col) +
+					", numL=" + std::to_string(numL_));
+			}
+			entriesPerLandmark[static_cast<size_t>(blockPos.col)]++;
+		}
+
+		size_t capacity = 0;
+		for (const int count : entriesPerLandmark)
+		{
+			const size_t n = static_cast<size_t>(count);
+			capacity += n * (n + 1U) / 2U;
+			if (capacity > static_cast<size_t>(std::numeric_limits<int>::max()))
+			{
+				throw std::runtime_error("Hpl pair enumeration exceeds int capacity");
+			}
+		}
+		return static_cast<int>(capacity);
+	}
+
 	////////////////////////////////////////////////////////////////////////////////////
 	// host buffers
 	////////////////////////////////////////////////////////////////////////////////////
@@ -1307,8 +1358,10 @@ private:
 	// | HplT Hll ||Δxl|   |-bl|
 	GpuPxPBlockVec d_Hpp_;
 	// Option 4 Phase 2: fixed-point int64 mirror of d_Hpp_.values() used for
-	// deterministic atomicAdd on the joint ext path. Allocated only when
-	// deterministicAccum_ && extJoint_ && numExt_>0. Size == d_Hpp_.elemSize().
+	// deterministic atomicAdd on all optimized pose slots. The historical
+	// "_ext_" name is retained because the buffer originally covered only the
+	// joint-ext range. Allocated when deterministicAccum_ && optimizeP_ &&
+	// numP_>0. Size == d_Hpp_.elemSize().
 	DeviceBuffer<long long> d_Hpp_int_ext_;
 	GpuLxLBlockVec d_Hll_;
 	// Option 4 Phase 3c: fixed-point int64 mirror of d_Hll_.values() used for
@@ -1329,9 +1382,10 @@ private:
 	GpuVec1d d_b_;
 	GpuPx1BlockVec d_bp_;
 	// Option 4 Phase 3a: fixed-point int64 mirror of d_bp_.values() used for
-	// deterministic atomicAdd on the joint ext gradient vector. Allocated only
-	// when deterministicAccum_ && extJoint_ && numExt_>0. Size ==
-	// d_bp_.elemSize().
+	// deterministic atomicAdd on all optimized pose gradient slots. The
+	// historical "_ext_" name is retained because the buffer originally
+	// covered only the joint-ext range. Allocated when deterministicAccum_ &&
+	// optimizeP_ && numP_>0. Size == d_bp_.elemSize().
 	DeviceBuffer<long long> d_bp_int_ext_;
 	GpuLx1BlockVec d_bl_;
 	// Option 4 Phase 3c: fixed-point int64 mirror of d_bl_.values() used for
@@ -1380,6 +1434,12 @@ private:
 
 	// temporary buffer
 	DeviceBuffer<Scalar> d_chi_;
+	// Option 4 Phase 3g: single-element int64 mirror of `d_chi_` used for the
+	// deterministic final reduction in `computeActiveErrorsKernel` and
+	// `computeScaleKernel`. Shared between the two call sites because they
+	// never overlap in time (computeErrors runs before computeScale each LM
+	// iteration). Allocated only when `deterministicAccum_` is active.
+	DeviceBuffer<long long> d_chi_int_;
 	GpuVec1i d_nnzPerCol_;
 
 	////////////////////////////////////////////////////////////////////////////////////
@@ -1412,7 +1472,8 @@ public:
 
 	void addMonocularEdge(Edge2D* e) override
 	{
-		edges2D_.insert(e);
+		if (edgeSet2D_.insert(e).second)
+			edges2D_.push_back(e);
 
 		e->vertexP->edges.insert(e);
 		e->vertexL->edges.insert(e);
@@ -1423,7 +1484,8 @@ public:
 
 	void addStereoEdge(Edge3D* e) override
 	{
-		edges3D_.insert(e);
+		if (edgeSet3D_.insert(e).second)
+			edges3D_.push_back(e);
 
 		e->vertexP->edges.insert(e);
 		e->vertexL->edges.insert(e);
@@ -1490,15 +1552,23 @@ public:
 		if (e->dim() == 2)
 		{
 			auto edge2D = reinterpret_cast<Edge2D*>(e);
-			if (edges2D_.count(edge2D))
-				edges2D_.erase(edge2D);
+			if (edgeSet2D_.erase(edge2D) > 0)
+			{
+				auto edge2DIt = std::find(edges2D_.begin(), edges2D_.end(), edge2D);
+				if (edge2DIt != edges2D_.end())
+					edges2D_.erase(edge2DIt);
+			}
 		}
 
 		if (e->dim() == 3)
 		{
 			auto edge3D = reinterpret_cast<Edge3D*>(e);
-			if (edges3D_.count(edge3D))
-				edges3D_.erase(edge3D);
+			if (edgeSet3D_.erase(edge3D) > 0)
+			{
+				auto edge3DIt = std::find(edges3D_.begin(), edges3D_.end(), edge3D);
+				if (edge3DIt != edges3D_.end())
+					edges3D_.erase(edge3DIt);
+			}
 		}
 	}
 
@@ -1629,6 +1699,8 @@ public:
 		vertexMapE_.clear();
 		edges2D_.clear();
 		edges3D_.clear();
+		edgeSet2D_.clear();
+		edgeSet3D_.clear();
 		stats_.clear();
 	}
 
@@ -1663,6 +1735,8 @@ private:
 	VertexMapE vertexMapE_;
 	EdgeSet2D edges2D_;
 	EdgeSet3D edges3D_;
+	std::unordered_set<Edge2D*> edgeSet2D_;
+	std::unordered_set<Edge3D*> edgeSet3D_;
 	RobustKernel kernels_[EDGE_TYPE_NUM];
 
 	BatchStatistics stats_;
