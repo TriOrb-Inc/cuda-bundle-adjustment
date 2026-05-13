@@ -68,6 +68,7 @@ struct CameraParams
 struct PoseVertex;
 struct LandmarkVertex;
 struct ExtrinsicsVertex;
+struct RelativePoseEdge;
 
 /** @brief Base edge struct.
 */
@@ -214,6 +215,41 @@ struct PoseVertex
 	int id;                  //!< ID of the vertex.
 	int iP;                  //!< ID of the vertex (internally used).
 	Set<BaseEdge*> edges;    //!< connected edges.
+	Set<RelativePoseEdge*> relativePoseEdges; //!< connected pose-pose relative prior edges.
+};
+
+/** @brief Pose-pose relative prior edge for Full BA shape preservation.
+*/
+struct RelativePoseEdge
+{
+	using Rotation = Eigen::Quaterniond;
+	using Translation = Array<double, 3>;
+
+	/** @brief The constructor.
+	*/
+	RelativePoseEdge()
+		: fromVertex(nullptr), toVertex(nullptr), q_rel(Rotation::Identity()),
+		  t_rel(Translation::Zero()), translationInformation(0), rotationInformation(0) {}
+
+	/** @brief The constructor.
+	@param from connected source pose vertex.
+	@param to connected target pose vertex.
+	@param q measured relative rotation from source pose to target pose.
+	@param t measured relative translation from source pose to target pose.
+	@param translation_info translation information scalar.
+	@param rotation_info rotation information scalar.
+	*/
+	RelativePoseEdge(PoseVertex* from, PoseVertex* to, const Rotation& q, const Translation& t,
+		double translation_info, double rotation_info)
+		: fromVertex(from), toVertex(to), q_rel(q), t_rel(t),
+		  translationInformation(translation_info), rotationInformation(rotation_info) {}
+
+	PoseVertex* fromVertex;         //!< source pose vertex.
+	PoseVertex* toVertex;           //!< target pose vertex.
+	Rotation q_rel;                 //!< measured relative rotation.
+	Translation t_rel;              //!< measured relative translation.
+	double translationInformation;   //!< scalar weight for translation residual.
+	double rotationInformation;      //!< scalar weight for rotation residual.
 };
 
 /** @brief Landmark vertex struct.

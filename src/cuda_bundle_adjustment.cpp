@@ -82,6 +82,7 @@ using VertexMapL = std::map<int, VertexL*>;
 using VertexMapE = std::map<int, ExtrinsicsVertex*>;
 using EdgeSet2D = std::vector<Edge2D*>;
 using EdgeSet3D = std::vector<Edge3D*>;
+using EdgeSetRelative = std::vector<RelativePoseEdge*>;
 using time_point = decltype(std::chrono::steady_clock::now());
 
 static inline time_point get_time_point()
@@ -154,8 +155,14 @@ public:
 		q_exts_.clear();
 		t_exts_.clear();
 		distortions_.clear();
+		relativePoseEdges_.clear();
+		relativePoseEdge2P_.clear();
+		relativePoseInfos_.clear();
+		relativePoseMeasuredQs_.clear();
+		relativePoseMeasuredTs_.clear();
+		relativePoseEdge2Hsc_.clear();
 
-		numP_ = numL_ = nedges2D_ = nedges3D_ = nHplBlocks_ = 0;
+		numP_ = numL_ = nedges2D_ = nedges3D_ = nRelativePoseEdges_ = nHplBlocks_ = 0;
 		optimizeP_ = optimizeL_ = false;
 
 		// Joint ext optimization bookkeeping (Option A).
@@ -175,13 +182,15 @@ public:
 
 	void initialize(const VertexMapP& vertexMapP, const VertexMapL& vertexMapL,
 		const VertexMapE& vertexMapE,
-		const EdgeSet2D& edgeSet2D, const EdgeSet3D& edgeSet3D, const RobustKernel kernels[])
+		const EdgeSet2D& edgeSet2D, const EdgeSet3D& edgeSet3D,
+		const EdgeSetRelative& relativePoseEdges, const RobustKernel kernels[])
 	{
 		trace_cuda_ba(
 			"solver initialize begin: pose_vertices=" + std::to_string(vertexMapP.size()) +
 			", landmark_vertices=" + std::to_string(vertexMapL.size()) +
 			", edges2d=" + std::to_string(edgeSet2D.size()) +
-			", edges3d=" + std::to_string(edgeSet3D.size()));
+			", edges3d=" + std::to_string(edgeSet3D.size()) +
+			", relative_pose_edges=" + std::to_string(relativePoseEdges.size()));
 		const auto t0 = std::chrono::steady_clock::now();
 		trace_cuda_ba("solver initialize after start timestamp");
 
@@ -213,7 +222,7 @@ public:
 		// gather rotations and translations into each vector
 		for (const auto& [id, vertexP] : vertexMapP)
 		{
-			if (vertexP->edges.empty())
+			if (vertexP->edges.empty() && vertexP->relativePoseEdges.empty())
 				continue;
 
 			if (!vertexP->fixed)
@@ -321,6 +330,35 @@ public:
 			verticesL_.push_back(vertexL);
 			Xws_.emplace_back(vertexL->Xw.data());
 		}
+
+		for (auto edge : relativePoseEdges)
+		{
+			if (edge == nullptr || edge->fromVertex == nullptr || edge->toVertex == nullptr)
+				continue;
+			const auto fromVertex = edge->fromVertex;
+			const auto toVertex = edge->toVertex;
+			if (fromVertex->iP < 0 || toVertex->iP < 0)
+				continue;
+			if (fromVertex->fixed && toVertex->fixed)
+				continue;
+
+			relativePoseEdges_.push_back(edge);
+			Vec4i edgeSlots;
+			edgeSlots[0] = fromVertex->iP;
+			edgeSlots[1] = toVertex->iP;
+			edgeSlots[2] = fromVertex->fixed ? -1 : fromVertex->iP;
+			edgeSlots[3] = toVertex->fixed ? -1 : toVertex->iP;
+			relativePoseEdge2P_.push_back(edgeSlots);
+
+			Vec2d info;
+			info[0] = ScalarCast(edge->rotationInformation);
+			info[1] = ScalarCast(edge->translationInformation);
+			relativePoseInfos_.push_back(info);
+			relativePoseMeasuredQs_.emplace_back(edge->q_rel.coeffs().data());
+			relativePoseMeasuredTs_.emplace_back(edge->t_rel.data());
+			relativePoseEdge2Hsc_.push_back(-1);
+		}
+		nRelativePoseEdges_ = static_cast<int>(relativePoseEdges_.size());
 
 		// Dedup map for ext Hpl block structure. Multiple edges may share the same
 		// (iP_ext, iL) pair (same camera observing the same landmark from different
@@ -500,6 +538,7 @@ public:
 			", total_poses=" + std::to_string(verticesP_.size()) +
 			", total_landmarks=" + std::to_string(verticesL_.size()) +
 			", base_edges=" + std::to_string(baseEdges_.size()) +
+			", relative_pose_edges=" + std::to_string(nRelativePoseEdges_) +
 			", hpl_blocks=" + std::to_string(nHplBlocks_));
 
 		// set robust kernels
@@ -589,7 +628,7 @@ public:
 			// build Hschur block matrix structure. Joint mode passes ext vertices
 			// so shared landmarks produce body-ext and ext-ext cross blocks.
 			Hsc_.resize(numP_, numP_);
-			Hsc_.constructFromVertices(verticesL_);
+			Hsc_.constructFromVerticesAndRelativeEdges(verticesL_, relativePoseEdges_);
 			Hsc_.convertBSRToCSR();
 
 				d_Hsc_.resize(numP_, numP_);
@@ -725,6 +764,30 @@ public:
 				d_edge2HscPE_.assign(static_cast<size_t>(nedges_total), edge2HscPE_.data());
 				d_edge2HscPE2D_.map(nedges2D_, d_edge2HscPE_.data());
 				d_edge2HscPE3D_.map(nedges3D_, d_edge2HscPE_.data() + nedges2D_);
+
+				if (nRelativePoseEdges_ > 0)
+				{
+					const int* hscOuter = Hsc_.outerIndices();
+					const int* hscInner = Hsc_.innerIndices();
+					for (int edge_idx = 0; edge_idx < nRelativePoseEdges_; ++edge_idx)
+					{
+						const int fromActive = relativePoseEdge2P_[edge_idx][2];
+						const int toActive = relativePoseEdge2P_[edge_idx][3];
+						if (fromActive < 0 || toActive < 0 || fromActive == toActive)
+							continue;
+
+						const int row = std::min(fromActive, toActive);
+						const int col = std::max(fromActive, toActive);
+						for (int hidx = hscOuter[row]; hidx < hscOuter[row + 1]; ++hidx)
+						{
+							if (hscInner[hidx] == col)
+							{
+								relativePoseEdge2Hsc_[edge_idx] = hidx;
+								break;
+							}
+						}
+					}
+				}
 			}
 
 		// upload solutions to device memory
@@ -762,6 +825,12 @@ public:
 
 		// upload per-edge distortion coefficients to device memory (2D only)
 		d_distortions_2D_.assign(nedges2D_, distortions_.data());
+		d_relativePoseEdge2P_.assign(nRelativePoseEdges_, relativePoseEdge2P_.data());
+		d_relativePoseInfos_.assign(nRelativePoseEdges_, relativePoseInfos_.data());
+		d_relativePoseMeasuredQs_.assign(nRelativePoseEdges_, relativePoseMeasuredQs_.data());
+		d_relativePoseMeasuredTs_.assign(nRelativePoseEdges_, relativePoseMeasuredTs_.data());
+		d_relativePoseErrors_.resize(nRelativePoseEdges_);
+		d_relativePoseEdge2Hsc_.assign(nRelativePoseEdges_, relativePoseEdge2Hsc_.data());
 
 		d_chi_.resize(1);
 		// Option 4 Phase 3g: single-element int64 accumulator shared between
@@ -813,11 +882,14 @@ public:
 
 		const Scalar chi3D = gpu::computeActiveErrors(d_qs_, d_ts_, d_cameras_, d_Xws_, d_measurements3D_,
 			d_omegas3D_, d_edge2PL3D_, d_q_exts_3D_, d_t_exts_3D_, kernels_[1], d_errors3D_, d_Xcs3D_, d_chi_, chi_int_ptr);
+		const Scalar chiRelativePose = gpu::computeRelativePosePriorErrors(d_qs_, d_ts_,
+			d_relativePoseEdge2P_, d_relativePoseMeasuredQs_, d_relativePoseMeasuredTs_,
+			d_relativePoseInfos_, d_relativePoseErrors_, d_chi_, chi_int_ptr);
 
 		const auto t1 = get_time_point();
 		profItems_[PROF_ITEM_COMPUTE_ERROR] += get_duration(t0, t1);
 
-		return chi2D + chi3D;
+		return chi2D + chi3D + chiRelativePose;
 	}
 
 	// Joint mode: scatter the current ext solution (qs_/ts_ at iP in [numBody_, numBody_+numExt_))
@@ -924,6 +996,12 @@ public:
 
 			gpu::constructQuadraticForm(d_Xcs3D_, d_qs_, d_cameras_, d_errors3D_, d_omegas3D_, d_edge2PL3D_,
 				d_edge2Hpl3D_, d_edge2HplExt3D_, d_edge2ExtIP3D_, d_edge2HscPE3D_, d_edgeFlags3D_, d_q_exts_3D_, d_t_exts_3D_, kernels_[1], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_, d_Hpp_int_ext_ptr, d_bp_int_ext_ptr, d_Hll_int_ptr, d_bl_int_ptr, d_HscDirect_int_ptr, d_Hpl_ext_int_ptr);
+
+			gpu::constructRelativePosePriorQuadraticForm(d_qs_, d_ts_,
+				d_relativePoseMeasuredQs_, d_relativePoseMeasuredTs_, d_relativePoseErrors_,
+				d_relativePoseEdge2P_, d_relativePoseInfos_, d_relativePoseEdge2Hsc_,
+				d_Hpp_, d_bp_, d_HscDirect_, d_Hpp_int_ext_ptr, d_bp_int_ext_ptr,
+				d_HscDirect_int_ptr);
 
 			if (useDetAccumP)
 			{
@@ -1295,6 +1373,13 @@ private:
 	std::vector<PLIndex> edge2PL_;
 	std::vector<uint8_t> edgeFlags_;
 	std::vector<Scalar> chiSqs_;
+	std::vector<RelativePoseEdge*> relativePoseEdges_;
+	std::vector<Vec4i> relativePoseEdge2P_;
+	std::vector<Vec2d> relativePoseInfos_;
+	std::vector<Vec4d> relativePoseMeasuredQs_;
+	std::vector<Vec3d> relativePoseMeasuredTs_;
+	std::vector<int> relativePoseEdge2Hsc_;
+	int nRelativePoseEdges_;
 
 	// per-edge extrinsics (camera_from_body transform)
 	std::vector<Vec4d> q_exts_;
@@ -1340,6 +1425,12 @@ private:
 		// Joint-mode direct Hsc(body, ext) slot per edge (-1 sentinel when absent/fixed).
 		GpuVec1i d_edge2HscPE_, d_edge2HscPE2D_, d_edge2HscPE3D_;
 		GpuVec1d d_chiSqs_, d_chiSqs2D_, d_chiSqs3D_;
+		GpuVec4i d_relativePoseEdge2P_;
+		GpuVec2d d_relativePoseInfos_;
+		GpuVec4d d_relativePoseMeasuredQs_;
+		GpuVec3d d_relativePoseMeasuredTs_;
+		GpuVec6d d_relativePoseErrors_;
+		GpuVec1i d_relativePoseEdge2Hsc_;
 
 	// per-edge extrinsics on device
 	GpuVec4d d_q_exts_2D_, d_q_exts_3D_;
@@ -1494,6 +1585,17 @@ public:
 		}
 	}
 
+	void addRelativePoseEdge(RelativePoseEdge* e) override
+	{
+		if (e == nullptr || e->fromVertex == nullptr || e->toVertex == nullptr)
+			return;
+		if (relativePoseEdgeSet_.insert(e).second)
+			relativePoseEdges_.push_back(e);
+
+		e->fromVertex->relativePoseEdges.insert(e);
+		e->toVertex->relativePoseEdges.insert(e);
+	}
+
 	VertexP* poseVertex(int id) const override
 	{
 		return vertexMapP_.at(id);
@@ -1518,6 +1620,8 @@ public:
 
 		for (auto e : it->second->edges)
 			removeEdge(e);
+		for (auto e : it->second->relativePoseEdges)
+			removeRelativePoseEdge(e);
 
 		vertexMapP_.erase(it);
 	}
@@ -1572,6 +1676,22 @@ public:
 		}
 	}
 
+	void removeRelativePoseEdge(RelativePoseEdge* e)
+	{
+		if (e == nullptr)
+			return;
+		if (e->fromVertex != nullptr && e->fromVertex->relativePoseEdges.count(e))
+			e->fromVertex->relativePoseEdges.erase(e);
+		if (e->toVertex != nullptr && e->toVertex->relativePoseEdges.count(e))
+			e->toVertex->relativePoseEdges.erase(e);
+		if (relativePoseEdgeSet_.erase(e) > 0)
+		{
+			auto edgeIt = std::find(relativePoseEdges_.begin(), relativePoseEdges_.end(), e);
+			if (edgeIt != relativePoseEdges_.end())
+				relativePoseEdges_.erase(edgeIt);
+		}
+	}
+
 	size_t nposes() const override
 	{
 		return vertexMapP_.size();
@@ -1584,7 +1704,7 @@ public:
 
 	size_t nedges() const override
 	{
-		return edges2D_.size() + edges3D_.size();
+		return edges2D_.size() + edges3D_.size() + relativePoseEdges_.size();
 	}
 
 	void setRobustKernels(RobustKernelType kernelType, double delta, EdgeType edgeType)
@@ -1599,7 +1719,7 @@ public:
 
 	void initialize() override
 	{
-		solver_.initialize(vertexMapP_, vertexMapL_, vertexMapE_, edges2D_, edges3D_, kernels_);
+		solver_.initialize(vertexMapP_, vertexMapL_, vertexMapE_, edges2D_, edges3D_, relativePoseEdges_, kernels_);
 
 		stats_.clear();
 	}
@@ -1699,8 +1819,10 @@ public:
 		vertexMapE_.clear();
 		edges2D_.clear();
 		edges3D_.clear();
+		relativePoseEdges_.clear();
 		edgeSet2D_.clear();
 		edgeSet3D_.clear();
+		relativePoseEdgeSet_.clear();
 		stats_.clear();
 	}
 
@@ -1737,6 +1859,8 @@ private:
 	EdgeSet3D edges3D_;
 	std::unordered_set<Edge2D*> edgeSet2D_;
 	std::unordered_set<Edge3D*> edgeSet3D_;
+	EdgeSetRelative relativePoseEdges_;
+	std::unordered_set<RelativePoseEdge*> relativePoseEdgeSet_;
 	RobustKernel kernels_[EDGE_TYPE_NUM];
 
 	BatchStatistics stats_;

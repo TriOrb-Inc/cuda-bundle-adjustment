@@ -54,6 +54,13 @@ void HplSparseBlockMatrix::constructFromBlockPos(std::vector<HplBlockPos>& block
 
 void HschurSparseBlockMatrix::constructFromVertices(const std::vector<VertexL*>& verticesL)
 {
+	constructFromVerticesAndRelativeEdges(verticesL, {});
+}
+
+void HschurSparseBlockMatrix::constructFromVerticesAndRelativeEdges(
+	const std::vector<VertexL*>& verticesL,
+	const std::vector<RelativePoseEdge*>& relativePoseEdges)
+{
 	struct BlockPos { int row, col; };
 
 	Eigen::VectorXi& browPtr_ = outerIndices_;
@@ -111,6 +118,47 @@ void HschurSparseBlockMatrix::constructFromVertices(const std::vector<VertexL*>&
 	}
 
 	nmultiplies_ = countmul;
+
+	for (auto edge : relativePoseEdges)
+	{
+		if (edge == nullptr || edge->fromVertex == nullptr || edge->toVertex == nullptr)
+			continue;
+		const auto from = edge->fromVertex;
+		const auto to = edge->toVertex;
+		if (from->fixed && to->fixed)
+			continue;
+		if (!from->fixed && from->iP >= 0)
+		{
+			const int rowId = from->iP;
+			uint8_t* ptrMap = map.data() + rowId * bcols_;
+			if (!ptrMap[rowId])
+			{
+				blockpos.push_back({ rowId, rowId });
+				ptrMap[rowId] = 1;
+			}
+		}
+		if (!to->fixed && to->iP >= 0)
+		{
+			const int rowId = to->iP;
+			uint8_t* ptrMap = map.data() + rowId * bcols_;
+			if (!ptrMap[rowId])
+			{
+				blockpos.push_back({ rowId, rowId });
+				ptrMap[rowId] = 1;
+			}
+		}
+		if (!from->fixed && !to->fixed && from->iP >= 0 && to->iP >= 0 && from->iP != to->iP)
+		{
+			const int rowId = std::min(from->iP, to->iP);
+			const int colId = std::max(from->iP, to->iP);
+			uint8_t* ptrMap = map.data() + rowId * bcols_;
+			if (!ptrMap[colId])
+			{
+				blockpos.push_back({ rowId, colId });
+				ptrMap[colId] = 1;
+			}
+		}
+	}
 
 	// set nonzero blocks
 	nblocks_ = static_cast<int>(blockpos.size());

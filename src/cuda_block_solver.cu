@@ -823,6 +823,14 @@ __device__ inline void multiplyQuaternion(const Vec4d& a, const Vec4d& b, Vec4d&
 	c[2] = a[3] * b[2] + a[2] * b[3] + a[0] * b[1] - a[1] * b[0];
 }
 
+__device__ inline void conjugateQuaternion(const Vec4d& q, Vec4d& q_conj)
+{
+	q_conj[0] = -q[0];
+	q_conj[1] = -q[1];
+	q_conj[2] = -q[2];
+	q_conj[3] = q[3];
+}
+
 __device__ inline void normalizeQuaternion(const Vec4d& a, Vec4d& b)
 {
 	Scalar invn = 1 / norm(a);
@@ -2105,6 +2113,313 @@ Scalar computeActiveErrors(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5
 	static GpuVec4d empty_distortions;
 	auto func = computeActiveErrorsFuncs[3 + kernel.type];
 	return func(qs, ts, cameras, Xws, measurements, omegas, edge2PL, q_exts, t_exts, empty_distortions, kernel.delta, errors, Xcs, chi, chi_int);
+}
+
+__global__ void computeRelativePosePriorErrorsKernel(int nedges, const Vec4d* qs, const Vec3d* ts,
+	const Vec4i* edge2P, const Vec4d* measuredQs, const Vec3d* measuredTs,
+	const Vec2d* informations, Vec6d* errors, Scalar* chi, long long* chi_int)
+{
+	const int iE = blockIdx.x * blockDim.x + threadIdx.x;
+	if (iE >= nedges)
+		return;
+
+	const Vec4i edge = edge2P[iE];
+	const int fromSlot = edge[0];
+	const int toSlot = edge[1];
+	const Vec4d& q_from = qs[fromSlot];
+	const Vec4d& q_to = qs[toSlot];
+	const Vec3d& t_from = ts[fromSlot];
+	const Vec3d& t_to = ts[toSlot];
+
+	Vec4d q_from_inv;
+	conjugateQuaternion(q_from, q_from_inv);
+	Vec4d predicted_q;
+	multiplyQuaternion(q_from_inv, q_to, predicted_q);
+	normalizeQuaternion(predicted_q, predicted_q);
+
+	Vec3d t_delta;
+	t_delta[0] = t_to[0] - t_from[0];
+	t_delta[1] = t_to[1] - t_from[1];
+	t_delta[2] = t_to[2] - t_from[2];
+	Vec3d predicted_t;
+	rotate(q_from_inv, t_delta, predicted_t);
+
+	Vec4d measured_inv;
+	conjugateQuaternion(measuredQs[iE], measured_inv);
+	Vec4d q_error;
+	multiplyQuaternion(measured_inv, predicted_q, q_error);
+	normalizeQuaternion(q_error, q_error);
+	if (q_error[3] < 0)
+	{
+		q_error[0] = -q_error[0];
+		q_error[1] = -q_error[1];
+		q_error[2] = -q_error[2];
+		q_error[3] = -q_error[3];
+	}
+
+	Vec6d error;
+	error[0] = Scalar(2) * q_error[0];
+	error[1] = Scalar(2) * q_error[1];
+	error[2] = Scalar(2) * q_error[2];
+	error[3] = predicted_t[0] - measuredTs[iE][0];
+	error[4] = predicted_t[1] - measuredTs[iE][1];
+	error[5] = predicted_t[2] - measuredTs[iE][2];
+	errors[iE] = error;
+
+	const Scalar rotInfo = informations[iE][0];
+	const Scalar transInfo = informations[iE][1];
+	const Scalar weightedChi =
+		rotInfo * (error[0] * error[0] + error[1] * error[1] + error[2] * error[2]) +
+		transInfo * (error[3] * error[3] + error[4] * error[4] + error[5] * error[5]);
+	if (chi_int != nullptr)
+		deterministic::atomicAccumDet(chi_int, weightedChi);
+	else
+		atomicAdd(chi, weightedChi);
+}
+
+__device__ inline void evaluateRelativePosePriorError(const Vec4d& q_from, const Vec3d& t_from,
+	const Vec4d& q_to, const Vec3d& t_to, const Vec4d& measured_q, const Vec3d& measured_t,
+	Scalar* error)
+{
+	Vec4d q_from_inv;
+	conjugateQuaternion(q_from, q_from_inv);
+	Vec4d predicted_q;
+	multiplyQuaternion(q_from_inv, q_to, predicted_q);
+	normalizeQuaternion(predicted_q, predicted_q);
+
+	Vec3d t_delta;
+	t_delta[0] = t_to[0] - t_from[0];
+	t_delta[1] = t_to[1] - t_from[1];
+	t_delta[2] = t_to[2] - t_from[2];
+	Vec3d predicted_t;
+	rotate(q_from_inv, t_delta, predicted_t);
+
+	Vec4d measured_inv;
+	conjugateQuaternion(measured_q, measured_inv);
+	Vec4d q_error;
+	multiplyQuaternion(measured_inv, predicted_q, q_error);
+	normalizeQuaternion(q_error, q_error);
+	if (q_error[3] < 0)
+	{
+		q_error[0] = -q_error[0];
+		q_error[1] = -q_error[1];
+		q_error[2] = -q_error[2];
+		q_error[3] = -q_error[3];
+	}
+
+	error[0] = Scalar(2) * q_error[0];
+	error[1] = Scalar(2) * q_error[1];
+	error[2] = Scalar(2) * q_error[2];
+	error[3] = predicted_t[0] - measured_t[0];
+	error[4] = predicted_t[1] - measured_t[1];
+	error[5] = predicted_t[2] - measured_t[2];
+}
+
+__device__ inline void perturbRelativePosePriorPose(const Vec4d& q, const Vec3d& t,
+	int dof, Scalar step, Vec4d& q_out, Vec3d& t_out)
+{
+	q_out = q;
+	t_out = t;
+
+	Scalar delta[PDIM];
+	for (int i = 0; i < PDIM; ++i)
+		delta[i] = Scalar(0);
+	delta[dof] = step;
+
+	Vec4d expq;
+	Vec3d expt;
+	updateExp(delta, expq, expt);
+	updatePose(expq, expt, q_out, t_out);
+}
+
+__device__ inline void computeRelativePosePriorNumericalJacobian(const Vec4d& q_from,
+	const Vec3d& t_from, const Vec4d& q_to, const Vec3d& t_to, const Vec4d& measured_q,
+	const Vec3d& measured_t, bool perturb_from, Scalar* jacobian)
+{
+	const Scalar eps_rot = Scalar(1e-6);
+	const Scalar eps_trans = Scalar(1e-6);
+	for (int dof = 0; dof < PDIM; ++dof)
+	{
+		const Scalar eps = (dof < 3) ? eps_rot : eps_trans;
+		Vec4d q_from_plus = q_from;
+		Vec4d q_from_minus = q_from;
+		Vec4d q_to_plus = q_to;
+		Vec4d q_to_minus = q_to;
+		Vec3d t_from_plus = t_from;
+		Vec3d t_from_minus = t_from;
+		Vec3d t_to_plus = t_to;
+		Vec3d t_to_minus = t_to;
+
+		if (perturb_from)
+		{
+			perturbRelativePosePriorPose(q_from, t_from, dof, eps, q_from_plus, t_from_plus);
+			perturbRelativePosePriorPose(q_from, t_from, dof, -eps, q_from_minus, t_from_minus);
+		}
+		else
+		{
+			perturbRelativePosePriorPose(q_to, t_to, dof, eps, q_to_plus, t_to_plus);
+			perturbRelativePosePriorPose(q_to, t_to, dof, -eps, q_to_minus, t_to_minus);
+		}
+
+		Scalar error_plus[PDIM];
+		Scalar error_minus[PDIM];
+		evaluateRelativePosePriorError(q_from_plus, t_from_plus, q_to_plus, t_to_plus,
+			measured_q, measured_t, error_plus);
+		evaluateRelativePosePriorError(q_from_minus, t_from_minus, q_to_minus, t_to_minus,
+			measured_q, measured_t, error_minus);
+		for (int row = 0; row < PDIM; ++row)
+			jacobian[row * PDIM + dof] = (error_plus[row] - error_minus[row]) / (Scalar(2) * eps);
+	}
+}
+
+__device__ inline void accumulateRelativePosePriorScalar(Scalar* values, long long* int_values,
+	int local_offset, int int_offset, Scalar value)
+{
+	if (int_values != nullptr)
+		deterministic::atomicAccumDet(int_values + int_offset, value);
+	else
+		atomicAdd(values + local_offset, value);
+}
+
+__global__ void constructRelativePosePriorQuadraticFormKernel(int nedges,
+	const Vec4d* qs, const Vec3d* ts, const Vec4d* measuredQs, const Vec3d* measuredTs,
+	const Vec6d* errors, const Vec4i* edge2P, const Vec2d* informations,
+	const int* edge2Hsc, PxPBlockPtr Hpp, Px1BlockPtr bp, PxPBlockPtr HscDirect,
+	long long* Hpp_int_raw, long long* bp_int_raw, long long* HscDirect_int_raw)
+{
+	const int iE = blockIdx.x * blockDim.x + threadIdx.x;
+	if (iE >= nedges)
+		return;
+
+	const Vec4i edge = edge2P[iE];
+	const int fromActiveSlot = edge[2];
+	const int toActiveSlot = edge[3];
+	const int hscSlot = edge2Hsc[iE];
+	const Vec6d& error = errors[iE];
+	const Vec4d& q_from = qs[edge[0]];
+	const Vec4d& q_to = qs[edge[1]];
+	const Vec3d& t_from = ts[edge[0]];
+	const Vec3d& t_to = ts[edge[1]];
+	Scalar jac_from[PDIM * PDIM];
+	Scalar jac_to[PDIM * PDIM];
+	computeRelativePosePriorNumericalJacobian(q_from, t_from, q_to, t_to,
+		measuredQs[iE], measuredTs[iE], true, jac_from);
+	computeRelativePosePriorNumericalJacobian(q_from, t_from, q_to, t_to,
+		measuredQs[iE], measuredTs[iE], false, jac_to);
+
+	Scalar info_diag[PDIM];
+	for (int row = 0; row < PDIM; ++row)
+		info_diag[row] = (row < 3) ? informations[iE][0] : informations[iE][1];
+
+	if (fromActiveSlot >= 0)
+	{
+		Scalar* hpp_block = Hpp.at(fromActiveSlot);
+		Scalar* bp_block = bp.at(fromActiveSlot);
+		for (int row = 0; row < PDIM; ++row)
+		{
+			for (int col = 0; col < PDIM; ++col)
+			{
+				Scalar value = Scalar(0);
+				for (int k = 0; k < PDIM; ++k)
+					value += jac_from[k * PDIM + row] * info_diag[k] * jac_from[k * PDIM + col];
+				accumulateRelativePosePriorScalar(hpp_block, Hpp_int_raw,
+					row * PDIM + col, fromActiveSlot * PDIM * PDIM + row * PDIM + col, value);
+			}
+
+			Scalar gradient = Scalar(0);
+			for (int k = 0; k < PDIM; ++k)
+				gradient += jac_from[k * PDIM + row] * info_diag[k] * error[k];
+			accumulateRelativePosePriorScalar(bp_block, bp_int_raw,
+				row, fromActiveSlot * PDIM + row, -gradient);
+		}
+	}
+	if (toActiveSlot >= 0)
+	{
+		Scalar* hpp_block = Hpp.at(toActiveSlot);
+		Scalar* bp_block = bp.at(toActiveSlot);
+		for (int row = 0; row < PDIM; ++row)
+		{
+			for (int col = 0; col < PDIM; ++col)
+			{
+				Scalar value = Scalar(0);
+				for (int k = 0; k < PDIM; ++k)
+					value += jac_to[k * PDIM + row] * info_diag[k] * jac_to[k * PDIM + col];
+				accumulateRelativePosePriorScalar(hpp_block, Hpp_int_raw,
+					row * PDIM + col, toActiveSlot * PDIM * PDIM + row * PDIM + col, value);
+			}
+
+			Scalar gradient = Scalar(0);
+			for (int k = 0; k < PDIM; ++k)
+				gradient += jac_to[k * PDIM + row] * info_diag[k] * error[k];
+			accumulateRelativePosePriorScalar(bp_block, bp_int_raw,
+				row, toActiveSlot * PDIM + row, -gradient);
+		}
+	}
+	if (fromActiveSlot >= 0 && toActiveSlot >= 0 && fromActiveSlot != toActiveSlot && hscSlot >= 0)
+	{
+		const Scalar* row_jac = (fromActiveSlot < toActiveSlot) ? jac_from : jac_to;
+		const Scalar* col_jac = (fromActiveSlot < toActiveSlot) ? jac_to : jac_from;
+		Scalar* hsc_block = HscDirect.at(hscSlot);
+		for (int row = 0; row < PDIM; ++row)
+		{
+			for (int col = 0; col < PDIM; ++col)
+			{
+				Scalar value = Scalar(0);
+				for (int k = 0; k < PDIM; ++k)
+					value += row_jac[k * PDIM + row] * info_diag[k] * col_jac[k * PDIM + col];
+				accumulateRelativePosePriorScalar(hsc_block, HscDirect_int_raw,
+					row * PDIM + col, hscSlot * PDIM * PDIM + row * PDIM + col, value);
+			}
+		}
+	}
+}
+
+Scalar computeRelativePosePriorErrors(const GpuVec4d& qs, const GpuVec3d& ts,
+	const GpuVec4i& edge2P, const GpuVec4d& measuredQs, const GpuVec3d& measuredTs,
+	const GpuVec2d& informations, GpuVec6d& errors, Scalar* chi, long long* chi_int)
+{
+	prepareCudaThreadContext();
+	const int nedges = edge2P.ssize();
+	if (nedges <= 0)
+		return 0;
+
+	const int block = 256;
+	const int grid = divUp(nedges, block);
+	if (chi_int != nullptr)
+		CUDA_CHECK(cudaMemset(chi_int, 0, sizeof(long long)));
+	CUDA_CHECK(cudaMemset(chi, 0, sizeof(Scalar)));
+	computeRelativePosePriorErrorsKernel<<<grid, block>>>(nedges, qs, ts, edge2P, measuredQs,
+		measuredTs, informations, errors, chi, chi_int);
+	CUDA_CHECK(cudaGetLastError());
+
+	if (chi_int != nullptr)
+	{
+		long long h_chi_int = 0;
+		CUDA_CHECK(cudaMemcpy(&h_chi_int, chi_int, sizeof(long long), cudaMemcpyDeviceToHost));
+		return deterministic::fromFixedPoint(h_chi_int);
+	}
+
+	Scalar h_chi = 0;
+	CUDA_CHECK(cudaMemcpy(&h_chi, chi, sizeof(Scalar), cudaMemcpyDeviceToHost));
+	return h_chi;
+}
+
+void constructRelativePosePriorQuadraticForm(const GpuVec4d& qs, const GpuVec3d& ts,
+	const GpuVec4d& measuredQs, const GpuVec3d& measuredTs, const GpuVec6d& errors,
+	const GpuVec4i& edge2P, const GpuVec2d& informations, const GpuVec1i& edge2Hsc,
+	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuHscBlockMat& HscDirect,
+	long long* Hpp_int_raw, long long* bp_int_raw, long long* HscDirect_int_raw)
+{
+	const int nedges = errors.ssize();
+	if (nedges <= 0)
+		return;
+
+	const int block = 256;
+	const int grid = divUp(nedges, block);
+	constructRelativePosePriorQuadraticFormKernel<<<grid, block>>>(nedges, qs, ts, measuredQs,
+		measuredTs, errors, edge2P, informations, edge2Hsc, Hpp, bp, HscDirect,
+		Hpp_int_raw, bp_int_raw, HscDirect_int_raw);
+	CUDA_CHECK(cudaGetLastError());
 }
 
 template <int MDIM, int RK_TYPE = 0>

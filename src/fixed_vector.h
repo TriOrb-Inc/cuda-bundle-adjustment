@@ -51,6 +51,7 @@ using Vec2d = Vec<Scalar, 2>;
 using Vec3d = Vec<Scalar, 3>;
 using Vec4d = Vec<Scalar, 4>;
 using Vec5d = Vec<Scalar, 5>;
+using Vec6d = Vec<Scalar, 6>;
 
 using Vec2i = Vec<int, 2>;
 using Vec3i = Vec<int, 3>;

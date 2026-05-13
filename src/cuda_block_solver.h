@@ -51,6 +51,10 @@ Scalar computeActiveErrors(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5
 	const RobustKernel& kernel,
 	GpuVec3d& errors, GpuVec3d& Xcs, Scalar* chi, long long* chi_int = nullptr);
 
+Scalar computeRelativePosePriorErrors(const GpuVec4d& qs, const GpuVec3d& ts,
+	const GpuVec4i& edge2P, const GpuVec4d& measuredQs, const GpuVec3d& measuredTs,
+	const GpuVec2d& informations, GpuVec6d& errors, Scalar* chi, long long* chi_int = nullptr);
+
 // Option 4 Phase 2+: `Hpp_int_ext_raw` / `bp_int_ext_raw` / `Hll_int_raw` /
 // `bl_int_raw` / `HscDirect_int_raw` are pointers into `long long` buffers
 // that mirror the layouts of `Hpp.values()`, `bp.values()`, `Hll.values()`,
@@ -97,6 +101,14 @@ void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVe
 	long long* bl_int_raw = nullptr,
 	long long* HscDirect_int_raw = nullptr,
 	long long* Hpl_ext_int_raw = nullptr);
+
+void constructRelativePosePriorQuadraticForm(const GpuVec4d& qs, const GpuVec3d& ts,
+	const GpuVec4d& measuredQs, const GpuVec3d& measuredTs, const GpuVec6d& errors,
+	const GpuVec4i& edge2P, const GpuVec2d& informations, const GpuVec1i& edge2Hsc,
+	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuHscBlockMat& HscDirect,
+	long long* Hpp_int_raw = nullptr,
+	long long* bp_int_raw = nullptr,
+	long long* HscDirect_int_raw = nullptr);
 
 // Option 4 Phase 2: copy the ext-range slots of a fixed-point int64 buffer
 // (`src_int`, sized identically to `Hpp.values()`) into the corresponding
