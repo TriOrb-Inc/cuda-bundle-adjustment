@@ -155,6 +155,7 @@ public:
 		q_exts_.clear();
 		t_exts_.clear();
 		distortions_.clear();
+		edge_cameras_.clear();
 		relativePoseEdges_.clear();
 		relativePoseEdge2P_.clear();
 		relativePoseInfos_.clear();
@@ -212,6 +213,7 @@ public:
 		q_exts_.reserve(edgeSet2D.size() + edgeSet3D.size());
 		t_exts_.reserve(edgeSet2D.size() + edgeSet3D.size());
 		distortions_.reserve(edgeSet2D.size());
+		edge_cameras_.reserve(edgeSet2D.size() + edgeSet3D.size());
 
 		std::vector<VertexP*> fixedVerticesP_;
 		std::vector<VertexL*> fixedVerticesL_;
@@ -382,6 +384,7 @@ public:
 				measurements2D_.emplace_back(e->measurement.data());
 				omegas_.push_back(ScalarCast(e->information));
 				edge2PL_.push_back({ vertexP->iP, vertexL->iL });
+				edge_cameras_.emplace_back(vectorize(e->hasCamera ? e->camera : vertexP->camera));
 				uint8_t flag = makeEdgeFlag(vertexP->fixed, vertexL->fixed);
 
 				// Per-edge extrinsics: prefer vertexE if present (P1.1 scaffold),
@@ -463,6 +466,7 @@ public:
 				measurements3D_.emplace_back(e->measurement.data());
 				omegas_.push_back(ScalarCast(e->information));
 				edge2PL_.push_back({ vertexP->iP, vertexL->iL });
+				edge_cameras_.emplace_back(vectorize(e->hasCamera ? e->camera : vertexP->camera));
 				uint8_t flag = makeEdgeFlag(vertexP->fixed, vertexL->fixed);
 
 				// Per-edge extrinsics: prefer vertexE if present, else fall back to q_ext/t_ext.
@@ -825,6 +829,10 @@ public:
 
 		// upload per-edge distortion coefficients to device memory (2D only)
 		d_distortions_2D_.assign(nedges2D_, distortions_.data());
+
+		// upload per-edge camera intrinsics to device memory
+		d_edge_cameras_2D_.assign(nedges2D_, edge_cameras_.data());
+		d_edge_cameras_3D_.assign(nedges3D_, edge_cameras_.data() + nedges2D_);
 		d_relativePoseEdge2P_.assign(nRelativePoseEdges_, relativePoseEdge2P_.data());
 		d_relativePoseInfos_.assign(nRelativePoseEdges_, relativePoseInfos_.data());
 		d_relativePoseMeasuredQs_.assign(nRelativePoseEdges_, relativePoseMeasuredQs_.data());
@@ -878,10 +886,10 @@ public:
 			? d_chi_int_.data() : nullptr;
 
 		const Scalar chi2D = gpu::computeActiveErrors(d_qs_, d_ts_, d_cameras_, d_Xws_, d_measurements2D_,
-			d_omegas2D_, d_edge2PL2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, kernels_[0], d_errors2D_, d_Xcs2D_, d_chi_, chi_int_ptr);
+			d_omegas2D_, d_edge2PL2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, d_edge_cameras_2D_, kernels_[0], d_errors2D_, d_Xcs2D_, d_chi_, chi_int_ptr);
 
 		const Scalar chi3D = gpu::computeActiveErrors(d_qs_, d_ts_, d_cameras_, d_Xws_, d_measurements3D_,
-			d_omegas3D_, d_edge2PL3D_, d_q_exts_3D_, d_t_exts_3D_, kernels_[1], d_errors3D_, d_Xcs3D_, d_chi_, chi_int_ptr);
+			d_omegas3D_, d_edge2PL3D_, d_q_exts_3D_, d_t_exts_3D_, d_edge_cameras_3D_, kernels_[1], d_errors3D_, d_Xcs3D_, d_chi_, chi_int_ptr);
 		const Scalar chiRelativePose = gpu::computeRelativePosePriorErrors(d_qs_, d_ts_,
 			d_relativePoseEdge2P_, d_relativePoseMeasuredQs_, d_relativePoseMeasuredTs_,
 			d_relativePoseInfos_, d_relativePoseErrors_, d_chi_, chi_int_ptr);
@@ -992,10 +1000,10 @@ public:
 			}
 
 			gpu::constructQuadraticForm(d_Xcs2D_, d_qs_, d_cameras_, d_errors2D_, d_omegas2D_, d_edge2PL2D_,
-				d_edge2Hpl2D_, d_edge2HplExt2D_, d_edge2ExtIP2D_, d_edge2HscPE2D_, d_edgeFlags2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, kernels_[0], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_, d_Hpp_int_ext_ptr, d_bp_int_ext_ptr, d_Hll_int_ptr, d_bl_int_ptr, d_HscDirect_int_ptr, d_Hpl_ext_int_ptr);
+				d_edge2Hpl2D_, d_edge2HplExt2D_, d_edge2ExtIP2D_, d_edge2HscPE2D_, d_edgeFlags2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, d_edge_cameras_2D_, kernels_[0], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_, d_Hpp_int_ext_ptr, d_bp_int_ext_ptr, d_Hll_int_ptr, d_bl_int_ptr, d_HscDirect_int_ptr, d_Hpl_ext_int_ptr);
 
 			gpu::constructQuadraticForm(d_Xcs3D_, d_qs_, d_cameras_, d_errors3D_, d_omegas3D_, d_edge2PL3D_,
-				d_edge2Hpl3D_, d_edge2HplExt3D_, d_edge2ExtIP3D_, d_edge2HscPE3D_, d_edgeFlags3D_, d_q_exts_3D_, d_t_exts_3D_, kernels_[1], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_, d_Hpp_int_ext_ptr, d_bp_int_ext_ptr, d_Hll_int_ptr, d_bl_int_ptr, d_HscDirect_int_ptr, d_Hpl_ext_int_ptr);
+				d_edge2Hpl3D_, d_edge2HplExt3D_, d_edge2ExtIP3D_, d_edge2HscPE3D_, d_edgeFlags3D_, d_q_exts_3D_, d_t_exts_3D_, d_edge_cameras_3D_, kernels_[1], d_Hpp_, d_bp_, d_Hll_, d_bl_, d_Hpl_, d_HscDirect_, d_Hpp_int_ext_ptr, d_bp_int_ext_ptr, d_Hll_int_ptr, d_bl_int_ptr, d_HscDirect_int_ptr, d_Hpl_ext_int_ptr);
 
 			gpu::constructRelativePosePriorQuadraticForm(d_qs_, d_ts_,
 				d_relativePoseMeasuredQs_, d_relativePoseMeasuredTs_, d_relativePoseErrors_,
@@ -1269,9 +1277,9 @@ public:
 
 		// compute chi-squares
 		gpu::computeChiSquares(d_qs_, d_ts_, d_cameras_, d_Xws_, d_measurements2D_,
-			d_omegas2D_, d_edge2PL2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, d_chiSqs2D_);
+			d_omegas2D_, d_edge2PL2D_, d_q_exts_2D_, d_t_exts_2D_, d_distortions_2D_, d_edge_cameras_2D_, d_chiSqs2D_);
 		gpu::computeChiSquares(d_qs_, d_ts_, d_cameras_, d_Xws_, d_measurements3D_,
-			d_omegas3D_, d_edge2PL3D_, d_q_exts_3D_, d_t_exts_3D_, d_chiSqs3D_);
+			d_omegas3D_, d_edge2PL3D_, d_q_exts_3D_, d_t_exts_3D_, d_edge_cameras_3D_, d_chiSqs3D_);
 		d_chiSqs_.download(chiSqs_.data());
 
 		for (size_t i = 0; i < chiSqs_.size(); i++)
@@ -1388,6 +1396,10 @@ private:
 	// per-edge distortion coefficients [k1, k2, k3, k4] (2D edges only)
 	std::vector<Vec4d> distortions_;
 
+	// per-edge camera intrinsics. Defaults to the connected pose camera when
+	// edge.hasCamera is false.
+	std::vector<Vec5d> edge_cameras_;
+
 	// block matrices
 	HplSparseBlockMatrix Hpl_;
 	HschurSparseBlockMatrix Hsc_;
@@ -1438,6 +1450,9 @@ private:
 
 	// per-edge distortion on device (2D only)
 	GpuVec4d d_distortions_2D_;
+
+	// per-edge camera intrinsics on device
+	GpuVec5d d_edge_cameras_2D_, d_edge_cameras_3D_;
 
 	// solution increments Δx = [Δxp Δxl]
 	GpuVec1d d_x_;
