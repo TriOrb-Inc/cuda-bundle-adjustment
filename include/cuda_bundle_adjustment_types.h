@@ -109,7 +109,7 @@ struct Edge : BaseEdge
 	Edge() : measurement(Measurement()), information(Information()),
 		vertexP(nullptr), vertexL(nullptr), vertexE(nullptr), hasExtrinsics(false),
 		q_ext(Eigen::Quaterniond::Identity()), t_ext(Eigen::Vector3d::Zero()),
-		hasDistortion(false), distortion{0, 0, 0, 0} {}
+		hasDistortion(false), distortion{0, 0, 0, 0}, hasCamera(false), camera() {}
 
 	/** @brief The constructor.
 	@param m measurement vector.
@@ -120,7 +120,7 @@ struct Edge : BaseEdge
 	Edge(const Measurement& m, Information I, PoseVertex* vertexP, LandmarkVertex* vertexL) :
 		measurement(m), information(I), vertexP(vertexP), vertexL(vertexL), vertexE(nullptr),
 		hasExtrinsics(false), q_ext(Eigen::Quaterniond::Identity()), t_ext(Eigen::Vector3d::Zero()),
-		hasDistortion(false), distortion{0, 0, 0, 0} {}
+		hasDistortion(false), distortion{0, 0, 0, 0}, hasCamera(false), camera() {}
 
 	/** @brief Returns the connected pose vertex.
 	*/
@@ -163,6 +163,12 @@ struct Edge : BaseEdge
 	// instead of pinhole: u = fx · X/Z + cx
 	bool hasDistortion;
 	double distortion[4];  //!< [k1, k2, k3, k4]
+
+	// Optional per-edge camera intrinsics. This is required for body-pose-centric
+	// multi-camera BA where one body pose vertex may feed observations from
+	// cameras with different fx/fy/cx/cy.
+	bool hasCamera;
+	CameraParams camera;
 };
 
 /** @brief Edge with 2-dimensional measurement (monocular observation).
