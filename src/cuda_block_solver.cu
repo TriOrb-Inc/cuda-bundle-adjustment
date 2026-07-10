@@ -2136,18 +2136,18 @@ __global__ void computeRelativePosePriorErrorsKernel(int nedges, const Vec4d* qs
 	const Vec3d& t_from = ts[fromSlot];
 	const Vec3d& t_to = ts[toSlot];
 
-	Vec4d q_from_inv;
-	conjugateQuaternion(q_from, q_from_inv);
+	Vec4d q_to_inv;
+	conjugateQuaternion(q_to, q_to_inv);
 	Vec4d predicted_q;
-	multiplyQuaternion(q_from_inv, q_to, predicted_q);
+	multiplyQuaternion(q_from, q_to_inv, predicted_q);
 	normalizeQuaternion(predicted_q, predicted_q);
 
-	Vec3d t_delta;
-	t_delta[0] = t_to[0] - t_from[0];
-	t_delta[1] = t_to[1] - t_from[1];
-	t_delta[2] = t_to[2] - t_from[2];
+	Vec3d rotated_to_t;
+	rotate(predicted_q, t_to, rotated_to_t);
 	Vec3d predicted_t;
-	rotate(q_from_inv, t_delta, predicted_t);
+	predicted_t[0] = t_from[0] - rotated_to_t[0];
+	predicted_t[1] = t_from[1] - rotated_to_t[1];
+	predicted_t[2] = t_from[2] - rotated_to_t[2];
 
 	Vec4d measured_inv;
 	conjugateQuaternion(measuredQs[iE], measured_inv);
@@ -2186,18 +2186,18 @@ __device__ inline void evaluateRelativePosePriorError(const Vec4d& q_from, const
 	const Vec4d& q_to, const Vec3d& t_to, const Vec4d& measured_q, const Vec3d& measured_t,
 	Scalar* error)
 {
-	Vec4d q_from_inv;
-	conjugateQuaternion(q_from, q_from_inv);
+	Vec4d q_to_inv;
+	conjugateQuaternion(q_to, q_to_inv);
 	Vec4d predicted_q;
-	multiplyQuaternion(q_from_inv, q_to, predicted_q);
+	multiplyQuaternion(q_from, q_to_inv, predicted_q);
 	normalizeQuaternion(predicted_q, predicted_q);
 
-	Vec3d t_delta;
-	t_delta[0] = t_to[0] - t_from[0];
-	t_delta[1] = t_to[1] - t_from[1];
-	t_delta[2] = t_to[2] - t_from[2];
+	Vec3d rotated_to_t;
+	rotate(predicted_q, t_to, rotated_to_t);
 	Vec3d predicted_t;
-	rotate(q_from_inv, t_delta, predicted_t);
+	predicted_t[0] = t_from[0] - rotated_to_t[0];
+	predicted_t[1] = t_from[1] - rotated_to_t[1];
+	predicted_t[2] = t_from[2] - rotated_to_t[2];
 
 	Vec4d measured_inv;
 	conjugateQuaternion(measured_q, measured_inv);

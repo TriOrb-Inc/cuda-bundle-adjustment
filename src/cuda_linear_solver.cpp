@@ -597,9 +597,11 @@ public:
 			cudaMemcpy(Acsr.val(), d_A, sizeof(Scalar) * Acsr.nnz(), cudaMemcpyDeviceToDevice);
 		}
 
-		// M = L * LT
-		if (!cholesky.factorize(Acsr))
-			information = Info::NUMERICAL_ISSUE;
+		// M = L * LT. LM retries factorization after increasing damping, so a
+		// successful retry must clear a numerical issue from the previous matrix.
+		information = cholesky.factorize(Acsr)
+			? Info::SUCCESS
+			: Info::NUMERICAL_ISSUE;
 		trace_cuda_ba("linear factorize end");
 	}
 
