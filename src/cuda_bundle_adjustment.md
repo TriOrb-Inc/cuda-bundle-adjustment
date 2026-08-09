@@ -40,6 +40,7 @@
 - `TRIORB_CUDA_BA_TRACE=1` では `Hschur multiply slots: hsc_unique_pairs=..., hpl_pair_capacity=..., hpl_blocks=...` を出し、`Hsc` dedup 数と実際の `Hpl` pair 列挙上限を比較できるようにしている。
 - `TRIORB_CUDA_BA_DETERMINISTIC_ACCUM=1` では、通常の body-only Local BA でも pose block `Hpp` / `bp` を fixed-point int64 mirror 経由で積算する。joint extrinsics 用に導入された `d_Hpp_int_ext_` / `d_bp_int_ext_` は名前を維持しているが、現在は全 pose slot を覆う full-size mirror として扱う。これにより body-only Local BA が `atomicAdd(double*)` に戻る経路を避ける。
 - `CudaBundleAdjustmentImpl` の top-level 2D / 3D edge container は `std::vector` とし、wrapper が受け取った FFI edge 配列の追加順を保つ。以前の `std::unordered_set<Edge*>` は pointer hash の iteration order に依存し、同一 `VisualBaProblem` でも `computeErrors()` の edge reduction order と `initial_chi2` が run 間で変わる原因になっていた。重複挿入は別の `std::unordered_set` で O(1) に保ち、既存の connected-edge set は vertex 側の `unordered_set` に残す。
+- LM iterationの目的関数はcombinedに加え、Visual側の既存Huber適用値とrelative pose側を別集計する。accepted stateと対応する両値をwrapperへ返し、外側のVisual品質gateへrelative costを混ぜない。
 
 ## 目標
 

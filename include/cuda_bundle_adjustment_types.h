@@ -235,7 +235,9 @@ struct RelativePoseEdge
 	*/
 	RelativePoseEdge()
 		: fromVertex(nullptr), toVertex(nullptr), q_rel(Rotation::Identity()),
-		  t_rel(Translation::Zero()), translationInformation(0), rotationInformation(0) {}
+		  t_rel(Translation::Zero()), translationInformation(0), rotationInformation(0),
+		  residualDofMask(0x3f), robustKernelType(0), factorWeight(1),
+		  robustDeltaSquared(1) {}
 
 	/** @brief The constructor.
 	@param from connected source pose vertex.
@@ -246,9 +248,13 @@ struct RelativePoseEdge
 	@param rotation_info rotation information scalar.
 	*/
 	RelativePoseEdge(PoseVertex* from, PoseVertex* to, const Rotation& q, const Translation& t,
-		double translation_info, double rotation_info)
+		double translation_info, double rotation_info, unsigned int residual_dof_mask = 0x3f,
+		int robust_kernel_type = 0, double factor_weight = 1,
+		double robust_delta_squared = 1)
 		: fromVertex(from), toVertex(to), q_rel(q), t_rel(t),
-		  translationInformation(translation_info), rotationInformation(rotation_info) {}
+		  translationInformation(translation_info), rotationInformation(rotation_info),
+		  residualDofMask(residual_dof_mask), robustKernelType(robust_kernel_type),
+		  factorWeight(factor_weight), robustDeltaSquared(robust_delta_squared) {}
 
 	PoseVertex* fromVertex;         //!< source pose vertex.
 	PoseVertex* toVertex;           //!< target pose vertex.
@@ -256,6 +262,10 @@ struct RelativePoseEdge
 	Translation t_rel;              //!< measured relative translation.
 	double translationInformation;   //!< scalar weight for translation residual.
 	double rotationInformation;      //!< scalar weight for rotation residual.
+	unsigned int residualDofMask;    //!< [rx,ry,rz,tx,ty,tz] residual bit mask.
+	int robustKernelType;            //!< 0=legacy none, 1=relative-only Cauchy.
+	double factorWeight;             //!< objective/quadratic form multiplier.
+	double robustDeltaSquared;       //!< squared Cauchy scale in normalized residual units.
 };
 
 /** @brief Landmark vertex struct.
@@ -336,6 +346,8 @@ struct BatchInfo
 {
 	int iteration;           //!< iteration number
 	double chi2;             //!< total chi2 (objective function value)
+	double visualChi2;       //!< robust visual-only objective component.
+	double relativePoseChi2; //!< relative-pose-only objective component.
 };
 
 using BatchStatistics = std::vector<BatchInfo>;
