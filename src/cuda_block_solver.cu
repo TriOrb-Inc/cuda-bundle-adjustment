@@ -2120,9 +2120,23 @@ Scalar computeActiveErrors(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5
 	return func(qs, ts, cameras, Xws, measurements, omegas, edge2PL, q_exts, t_exts, empty_distortions, edge_cameras, kernel.delta, errors, Xcs, chi, chi_int);
 }
 
+__device__ inline Scalar relativePoseYaw(const Vec4d& quaternion)
+{
+	return atan2(Scalar(2) * (quaternion[3] * quaternion[2] +
+		quaternion[0] * quaternion[1]),
+		Scalar(1) - Scalar(2) * (quaternion[1] * quaternion[1] +
+		quaternion[2] * quaternion[2]));
+}
+
+__device__ inline Scalar wrapRelativePoseAngle(Scalar angle)
+{
+	return atan2(sin(angle), cos(angle));
+}
+
 __global__ void computeRelativePosePriorErrorsKernel(int nedges, const Vec4d* qs, const Vec3d* ts,
 	const Vec4i* edge2P, const Vec4d* measuredQs, const Vec3d* measuredTs,
-	const Vec2d* informations, Vec6d* errors, Scalar* chi, long long* chi_int)
+	const Vec2d* informations, const int* residualMasks, const int* robustKernelTypes,
+	const Vec2d* robustConfigs, Vec6d* errors, Scalar* chi, long long* chi_int)
 {
 	const int iE = blockIdx.x * blockDim.x + threadIdx.x;
 	if (iE >= nedges)
@@ -2169,13 +2183,46 @@ __global__ void computeRelativePosePriorErrorsKernel(int nedges, const Vec4d* qs
 	error[3] = predicted_t[0] - measuredTs[iE][0];
 	error[4] = predicted_t[1] - measuredTs[iE][1];
 	error[5] = predicted_t[2] - measuredTs[iE][2];
+	const int residualMask = residualMasks[iE];
+	if (residualMask == 0x1c)
+	{
+		// planar odomはroll/pitch測定に依存せず、yaw差だけを正本にする。
+		error[0] = Scalar(0);
+		error[1] = Scalar(0);
+		error[2] = wrapRelativePoseAngle(
+			relativePoseYaw(predicted_q) - relativePoseYaw(measuredQs[iE]));
+	}
 	errors[iE] = error;
 
 	const Scalar rotInfo = informations[iE][0];
 	const Scalar transInfo = informations[iE][1];
-	const Scalar weightedChi =
-		rotInfo * (error[0] * error[0] + error[1] * error[1] + error[2] * error[2]) +
-		transInfo * (error[3] * error[3] + error[4] * error[4] + error[5] * error[5]);
+	Scalar weightedChi;
+	const int robustKernelType = robustKernelTypes[iE];
+	const Scalar factorWeight = robustConfigs[iE][0];
+	const Scalar robustDeltaSquared = robustConfigs[iE][1];
+	if (residualMask == 0x3f && robustKernelType == 0 && factorWeight == Scalar(1))
+	{
+		// legacy all-6/no-kernel edgeは従来式と演算順をそのまま通す。
+		weightedChi =
+			rotInfo * (error[0] * error[0] + error[1] * error[1] + error[2] * error[2]) +
+			transInfo * (error[3] * error[3] + error[4] * error[4] + error[5] * error[5]);
+	}
+	else
+	{
+		Scalar normalizedSquaredError = Scalar(0);
+		for (int component = 0; component < PDIM; ++component)
+		{
+			if ((residualMask & (1 << component)) == 0)
+				continue;
+			const Scalar information = component < 3 ? rotInfo : transInfo;
+			normalizedSquaredError += information * error[component] * error[component];
+		}
+		if (robustKernelType == 1)
+			weightedChi = factorWeight * robustDeltaSquared *
+				log1p(normalizedSquaredError / robustDeltaSquared);
+		else
+			weightedChi = factorWeight * normalizedSquaredError;
+	}
 	if (chi_int != nullptr)
 		deterministic::atomicAccumDet(chi_int, weightedChi);
 	else
@@ -2184,7 +2231,7 @@ __global__ void computeRelativePosePriorErrorsKernel(int nedges, const Vec4d* qs
 
 __device__ inline void evaluateRelativePosePriorError(const Vec4d& q_from, const Vec3d& t_from,
 	const Vec4d& q_to, const Vec3d& t_to, const Vec4d& measured_q, const Vec3d& measured_t,
-	Scalar* error)
+	int residualMask, Scalar* error)
 {
 	Vec4d q_to_inv;
 	conjugateQuaternion(q_to, q_to_inv);
@@ -2218,6 +2265,13 @@ __device__ inline void evaluateRelativePosePriorError(const Vec4d& q_from, const
 	error[3] = predicted_t[0] - measured_t[0];
 	error[4] = predicted_t[1] - measured_t[1];
 	error[5] = predicted_t[2] - measured_t[2];
+	if (residualMask == 0x1c)
+	{
+		error[0] = Scalar(0);
+		error[1] = Scalar(0);
+		error[2] = wrapRelativePoseAngle(
+			relativePoseYaw(predicted_q) - relativePoseYaw(measured_q));
+	}
 }
 
 __device__ inline void perturbRelativePosePriorPose(const Vec4d& q, const Vec3d& t,
@@ -2239,7 +2293,7 @@ __device__ inline void perturbRelativePosePriorPose(const Vec4d& q, const Vec3d&
 
 __device__ inline void computeRelativePosePriorNumericalJacobian(const Vec4d& q_from,
 	const Vec3d& t_from, const Vec4d& q_to, const Vec3d& t_to, const Vec4d& measured_q,
-	const Vec3d& measured_t, bool perturb_from, Scalar* jacobian)
+	const Vec3d& measured_t, int residualMask, bool perturb_from, Scalar* jacobian)
 {
 	const Scalar eps_rot = Scalar(1e-6);
 	const Scalar eps_trans = Scalar(1e-6);
@@ -2269,9 +2323,9 @@ __device__ inline void computeRelativePosePriorNumericalJacobian(const Vec4d& q_
 		Scalar error_plus[PDIM];
 		Scalar error_minus[PDIM];
 		evaluateRelativePosePriorError(q_from_plus, t_from_plus, q_to_plus, t_to_plus,
-			measured_q, measured_t, error_plus);
+			measured_q, measured_t, residualMask, error_plus);
 		evaluateRelativePosePriorError(q_from_minus, t_from_minus, q_to_minus, t_to_minus,
-			measured_q, measured_t, error_minus);
+			measured_q, measured_t, residualMask, error_minus);
 		for (int row = 0; row < PDIM; ++row)
 			jacobian[row * PDIM + dof] = (error_plus[row] - error_minus[row]) / (Scalar(2) * eps);
 	}
@@ -2289,7 +2343,8 @@ __device__ inline void accumulateRelativePosePriorScalar(Scalar* values, long lo
 __global__ void constructRelativePosePriorQuadraticFormKernel(int nedges,
 	const Vec4d* qs, const Vec3d* ts, const Vec4d* measuredQs, const Vec3d* measuredTs,
 	const Vec6d* errors, const Vec4i* edge2P, const Vec2d* informations,
-	const int* edge2Hsc, PxPBlockPtr Hpp, Px1BlockPtr bp, PxPBlockPtr HscDirect,
+	const int* edge2Hsc, const int* residualMasks, const int* robustKernelTypes,
+	const Vec2d* robustConfigs, PxPBlockPtr Hpp, Px1BlockPtr bp, PxPBlockPtr HscDirect,
 	long long* Hpp_int_raw, long long* bp_int_raw, long long* HscDirect_int_raw)
 {
 	const int iE = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2308,13 +2363,44 @@ __global__ void constructRelativePosePriorQuadraticFormKernel(int nedges,
 	Scalar jac_from[PDIM * PDIM];
 	Scalar jac_to[PDIM * PDIM];
 	computeRelativePosePriorNumericalJacobian(q_from, t_from, q_to, t_to,
-		measuredQs[iE], measuredTs[iE], true, jac_from);
+		measuredQs[iE], measuredTs[iE], residualMasks[iE], true, jac_from);
 	computeRelativePosePriorNumericalJacobian(q_from, t_from, q_to, t_to,
-		measuredQs[iE], measuredTs[iE], false, jac_to);
+		measuredQs[iE], measuredTs[iE], residualMasks[iE], false, jac_to);
 
 	Scalar info_diag[PDIM];
-	for (int row = 0; row < PDIM; ++row)
-		info_diag[row] = (row < 3) ? informations[iE][0] : informations[iE][1];
+	const int residualMask = residualMasks[iE];
+	const int robustKernelType = robustKernelTypes[iE];
+	const Scalar factorWeight = robustConfigs[iE][0];
+	const Scalar robustDeltaSquared = robustConfigs[iE][1];
+	if (residualMask == 0x3f && robustKernelType == 0 && factorWeight == Scalar(1))
+	{
+		// legacy all-6/no-kernel edgeは従来information生成をそのまま通す。
+		for (int row = 0; row < PDIM; ++row)
+			info_diag[row] = (row < 3) ? informations[iE][0] : informations[iE][1];
+	}
+	else
+	{
+		Scalar normalizedSquaredError = Scalar(0);
+		for (int component = 0; component < PDIM; ++component)
+		{
+			if ((residualMask & (1 << component)) == 0)
+				continue;
+			const Scalar information =
+				component < 3 ? informations[iE][0] : informations[iE][1];
+			normalizedSquaredError += information * error[component] * error[component];
+		}
+		const Scalar robustDerivative = robustKernelType == 1
+			? Scalar(1) / (Scalar(1) + normalizedSquaredError / robustDeltaSquared)
+			: Scalar(1);
+		for (int component = 0; component < PDIM; ++component)
+		{
+			const bool enabled = (residualMask & (1 << component)) != 0;
+			const Scalar information =
+				component < 3 ? informations[iE][0] : informations[iE][1];
+			info_diag[component] = enabled
+				? information * factorWeight * robustDerivative : Scalar(0);
+		}
+	}
 
 	if (fromActiveSlot >= 0)
 	{
@@ -2381,7 +2467,9 @@ __global__ void constructRelativePosePriorQuadraticFormKernel(int nedges,
 
 Scalar computeRelativePosePriorErrors(const GpuVec4d& qs, const GpuVec3d& ts,
 	const GpuVec4i& edge2P, const GpuVec4d& measuredQs, const GpuVec3d& measuredTs,
-	const GpuVec2d& informations, GpuVec6d& errors, Scalar* chi, long long* chi_int)
+	const GpuVec2d& informations, const GpuVec1i& residualMasks,
+	const GpuVec1i& robustKernelTypes, const GpuVec2d& robustConfigs,
+	GpuVec6d& errors, Scalar* chi, long long* chi_int)
 {
 	prepareCudaThreadContext();
 	const int nedges = edge2P.ssize();
@@ -2394,7 +2482,8 @@ Scalar computeRelativePosePriorErrors(const GpuVec4d& qs, const GpuVec3d& ts,
 		CUDA_CHECK(cudaMemset(chi_int, 0, sizeof(long long)));
 	CUDA_CHECK(cudaMemset(chi, 0, sizeof(Scalar)));
 	computeRelativePosePriorErrorsKernel<<<grid, block>>>(nedges, qs, ts, edge2P, measuredQs,
-		measuredTs, informations, errors, chi, chi_int);
+		measuredTs, informations, residualMasks, robustKernelTypes, robustConfigs,
+		errors, chi, chi_int);
 	CUDA_CHECK(cudaGetLastError());
 
 	if (chi_int != nullptr)
@@ -2412,6 +2501,8 @@ Scalar computeRelativePosePriorErrors(const GpuVec4d& qs, const GpuVec3d& ts,
 void constructRelativePosePriorQuadraticForm(const GpuVec4d& qs, const GpuVec3d& ts,
 	const GpuVec4d& measuredQs, const GpuVec3d& measuredTs, const GpuVec6d& errors,
 	const GpuVec4i& edge2P, const GpuVec2d& informations, const GpuVec1i& edge2Hsc,
+	const GpuVec1i& residualMasks, const GpuVec1i& robustKernelTypes,
+	const GpuVec2d& robustConfigs,
 	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuHscBlockMat& HscDirect,
 	long long* Hpp_int_raw, long long* bp_int_raw, long long* HscDirect_int_raw)
 {
@@ -2422,7 +2513,8 @@ void constructRelativePosePriorQuadraticForm(const GpuVec4d& qs, const GpuVec3d&
 	const int block = 256;
 	const int grid = divUp(nedges, block);
 	constructRelativePosePriorQuadraticFormKernel<<<grid, block>>>(nedges, qs, ts, measuredQs,
-		measuredTs, errors, edge2P, informations, edge2Hsc, Hpp, bp, HscDirect,
+		measuredTs, errors, edge2P, informations, edge2Hsc, residualMasks,
+		robustKernelTypes, robustConfigs, Hpp, bp, HscDirect,
 		Hpp_int_raw, bp_int_raw, HscDirect_int_raw);
 	CUDA_CHECK(cudaGetLastError());
 }

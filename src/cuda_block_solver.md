@@ -19,6 +19,7 @@
 - joint extrinsics solve では `constructQuadraticFormKernel()` が ext diagonal (`Je^TΩJe`) や ext-landmark (`Je^TΩJl`) だけでなく、direct pose-ext block (`Jp^TΩJe`) も `HscDirect` へ積みます。これを `computeHschure()` の初期値として使い、Schur term だけでは表現できない同一 edge 内の body-ext coupling を落とさないようにします。
 - `findHschureMulBlockIndicesKernel()` は、各 landmark column 内の `Hpl` row-slot pair を列挙して `computeHschureKernel()` 用の `mulBlockIds` を作ります。`Hsc` 側は unique Schur row pair へ dedup される一方、`Hpl` は multi-camera / joint-ext edge で同一 row pair の slot が複数残るため、`Hsc_.nmulBlocks()` をそのまま容量に使うと `mulBlockIds` が不足します。
 - relative pose prior は pose vertex の `pose-from-world` 状態 `V_from` / `V_to` から、Rust ABI と同じ world-from relative `Z = V_from * inverse(V_to)` を予測します。回転は `q_from * conjugate(q_to)`、並進は `t_from - R_pred * t_to` で評価します。
+- relative edgeは成分maskをerror、chi2、数値Jacobian、Hessian/gradientへ同じ順序で適用します。x/y/yaw maskでは平面yaw差とtx/tyだけを使い、relative専用Cauchyのcostと微分を同じmasked errorから計算します。
 
 ## 実装上の判断
 
@@ -31,6 +32,7 @@
 - `findHschureMulBlockIndices()` は、呼び出し側で確保された `mulBlockIds` の容量を kernel へ渡し、overflow 時は範囲外書き込みではなく `std::runtime_error` で停止します。これは `TRIORB_DISABLE_LIDAR=1` の旧経路で point cloud が残存した際、`findHschureMulBlockIndicesKernel` が `mulBlockIds[pos]` へ範囲外書き込みしていた問題への直接対策です。
 - `buildHplStructure()` と `findHschureMulBlockIndices()` の sort comparator は、duplicate slot を含む Schur 構造を `(col,row,edgeId)` / `(row,col,hplPairSlot)` の total order で並べます。`stable_sort` だけに依存すると、atomic prefix や入力 edge 列の同値キー順が solver 内部の slot 配置へ残るため、deterministic accumulation を有効にしても Local BA / Full BA の更新が微小に分岐し得ます。
 - relative pose prior の通常誤差と数値 Jacobian 用の摂動誤差は同じ world-from relative 式を使います。両 endpoint が active の場合も、各 endpoint の摂動に対して同一 residual を差分評価し、cross block を整合した Jacobian から構成します。
+- all-6/no-kernel/weight 1はlegacy演算式を独立分岐で維持し、既存loop/LiDAR relative edgeの順序と数値を変えません。
 
 ## 目標
 

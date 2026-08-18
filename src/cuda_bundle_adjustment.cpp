@@ -159,6 +159,9 @@ public:
 		relativePoseEdges_.clear();
 		relativePoseEdge2P_.clear();
 		relativePoseInfos_.clear();
+		relativePoseMasks_.clear();
+		relativePoseRobustKernelTypes_.clear();
+		relativePoseRobustConfigs_.clear();
 		relativePoseMeasuredQs_.clear();
 		relativePoseMeasuredTs_.clear();
 		relativePoseEdge2Hsc_.clear();
@@ -356,6 +359,12 @@ public:
 			info[0] = ScalarCast(edge->rotationInformation);
 			info[1] = ScalarCast(edge->translationInformation);
 			relativePoseInfos_.push_back(info);
+			relativePoseMasks_.push_back(static_cast<int>(edge->residualDofMask));
+			relativePoseRobustKernelTypes_.push_back(edge->robustKernelType);
+			Vec2d robustConfig;
+			robustConfig[0] = ScalarCast(edge->factorWeight);
+			robustConfig[1] = ScalarCast(edge->robustDeltaSquared);
+			relativePoseRobustConfigs_.push_back(robustConfig);
 			relativePoseMeasuredQs_.emplace_back(edge->q_rel.coeffs().data());
 			relativePoseMeasuredTs_.emplace_back(edge->t_rel.data());
 			relativePoseEdge2Hsc_.push_back(-1);
@@ -835,6 +844,11 @@ public:
 		d_edge_cameras_3D_.assign(nedges3D_, edge_cameras_.data() + nedges2D_);
 		d_relativePoseEdge2P_.assign(nRelativePoseEdges_, relativePoseEdge2P_.data());
 		d_relativePoseInfos_.assign(nRelativePoseEdges_, relativePoseInfos_.data());
+		d_relativePoseMasks_.assign(nRelativePoseEdges_, relativePoseMasks_.data());
+		d_relativePoseRobustKernelTypes_.assign(
+			nRelativePoseEdges_, relativePoseRobustKernelTypes_.data());
+		d_relativePoseRobustConfigs_.assign(
+			nRelativePoseEdges_, relativePoseRobustConfigs_.data());
 		d_relativePoseMeasuredQs_.assign(nRelativePoseEdges_, relativePoseMeasuredQs_.data());
 		d_relativePoseMeasuredTs_.assign(nRelativePoseEdges_, relativePoseMeasuredTs_.data());
 		d_relativePoseErrors_.resize(nRelativePoseEdges_);
@@ -870,7 +884,7 @@ public:
 		profItems_[PROF_ITEM_DECOMP_SYMBOLIC] += get_duration(t1, t2);
 	}
 
-	double computeErrors()
+	double computeErrors(double* visualChi2 = nullptr, double* relativePoseChi2 = nullptr)
 	{
 		const auto t0 = get_time_point();
 
@@ -892,10 +906,15 @@ public:
 			d_omegas3D_, d_edge2PL3D_, d_q_exts_3D_, d_t_exts_3D_, d_edge_cameras_3D_, kernels_[1], d_errors3D_, d_Xcs3D_, d_chi_, chi_int_ptr);
 		const Scalar chiRelativePose = gpu::computeRelativePosePriorErrors(d_qs_, d_ts_,
 			d_relativePoseEdge2P_, d_relativePoseMeasuredQs_, d_relativePoseMeasuredTs_,
-			d_relativePoseInfos_, d_relativePoseErrors_, d_chi_, chi_int_ptr);
+			d_relativePoseInfos_, d_relativePoseMasks_, d_relativePoseRobustKernelTypes_,
+			d_relativePoseRobustConfigs_, d_relativePoseErrors_, d_chi_, chi_int_ptr);
 
 		const auto t1 = get_time_point();
 		profItems_[PROF_ITEM_COMPUTE_ERROR] += get_duration(t0, t1);
+		if (visualChi2 != nullptr)
+			*visualChi2 = static_cast<double>(chi2D + chi3D);
+		if (relativePoseChi2 != nullptr)
+			*relativePoseChi2 = static_cast<double>(chiRelativePose);
 
 		return chi2D + chi3D + chiRelativePose;
 	}
@@ -1008,6 +1027,8 @@ public:
 			gpu::constructRelativePosePriorQuadraticForm(d_qs_, d_ts_,
 				d_relativePoseMeasuredQs_, d_relativePoseMeasuredTs_, d_relativePoseErrors_,
 				d_relativePoseEdge2P_, d_relativePoseInfos_, d_relativePoseEdge2Hsc_,
+				d_relativePoseMasks_, d_relativePoseRobustKernelTypes_,
+				d_relativePoseRobustConfigs_,
 				d_Hpp_, d_bp_, d_HscDirect_, d_Hpp_int_ext_ptr, d_bp_int_ext_ptr,
 				d_HscDirect_int_ptr);
 
@@ -1384,6 +1405,9 @@ private:
 	std::vector<RelativePoseEdge*> relativePoseEdges_;
 	std::vector<Vec4i> relativePoseEdge2P_;
 	std::vector<Vec2d> relativePoseInfos_;
+	std::vector<int> relativePoseMasks_;
+	std::vector<int> relativePoseRobustKernelTypes_;
+	std::vector<Vec2d> relativePoseRobustConfigs_;
 	std::vector<Vec4d> relativePoseMeasuredQs_;
 	std::vector<Vec3d> relativePoseMeasuredTs_;
 	std::vector<int> relativePoseEdge2Hsc_;
@@ -1439,6 +1463,9 @@ private:
 		GpuVec1d d_chiSqs_, d_chiSqs2D_, d_chiSqs3D_;
 		GpuVec4i d_relativePoseEdge2P_;
 		GpuVec2d d_relativePoseInfos_;
+		GpuVec1i d_relativePoseMasks_;
+		GpuVec1i d_relativePoseRobustKernelTypes_;
+		GpuVec2d d_relativePoseRobustConfigs_;
 		GpuVec4d d_relativePoseMeasuredQs_;
 		GpuVec3d d_relativePoseMeasuredTs_;
 		GpuVec6d d_relativePoseErrors_;
@@ -1755,7 +1782,9 @@ public:
 			if (iteration == 0)
 				solver_.buildStructure();
 
-			const double iniF = solver_.computeErrors();
+			double visualF = 0;
+			double relativePoseF = 0;
+			const double iniF = solver_.computeErrors(&visualF, &relativePoseF);
 			F = iniF;
 			trace_cuda_ba("optimize computeErrors end: iteration=" + std::to_string(iteration) +
 				", initial_error=" + std::to_string(iniF));
@@ -1791,7 +1820,9 @@ public:
 				trace_cuda_ba("optimize update end: iteration=" + std::to_string(iteration) +
 					", attempt=" + std::to_string(q));
 
-				const double Fhat = solver_.computeErrors();
+				double visualFhat = 0;
+				double relativePoseFhat = 0;
+				const double Fhat = solver_.computeErrors(&visualFhat, &relativePoseFhat);
 				const double scale = solver_.computeScale(lambda) + 1e-3;
 				rho = success ? (F - Fhat) / scale : -1;
 				trace_cuda_ba("optimize rho evaluated: iteration=" + std::to_string(iteration) +
@@ -1805,6 +1836,8 @@ public:
 					lambda *= clamp(attenuation(rho), 1./3, 2./3);
 					nu = 2;
 					F = Fhat;
+					visualF = visualFhat;
+					relativePoseF = relativePoseFhat;
 					break;
 				}
 				else
@@ -1816,7 +1849,7 @@ public:
 				}
 			}
 
-			stats_.push_back({ iteration, F });
+			stats_.push_back({ iteration, F, visualF, relativePoseF });
 
 			if (q == maxq || rho <= 0 || !std::isfinite(lambda))
 				break;
