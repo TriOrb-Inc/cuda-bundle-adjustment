@@ -68,6 +68,7 @@ struct CameraParams
 struct PoseVertex;
 struct LandmarkVertex;
 struct ExtrinsicsVertex;
+struct RelativePoseEdge;
 
 /** @brief Base edge struct.
 */
@@ -108,7 +109,7 @@ struct Edge : BaseEdge
 	Edge() : measurement(Measurement()), information(Information()),
 		vertexP(nullptr), vertexL(nullptr), vertexE(nullptr), hasExtrinsics(false),
 		q_ext(Eigen::Quaterniond::Identity()), t_ext(Eigen::Vector3d::Zero()),
-		hasDistortion(false), distortion{0, 0, 0, 0} {}
+		hasDistortion(false), distortion{0, 0, 0, 0}, hasCamera(false), camera() {}
 
 	/** @brief The constructor.
 	@param m measurement vector.
@@ -119,7 +120,7 @@ struct Edge : BaseEdge
 	Edge(const Measurement& m, Information I, PoseVertex* vertexP, LandmarkVertex* vertexL) :
 		measurement(m), information(I), vertexP(vertexP), vertexL(vertexL), vertexE(nullptr),
 		hasExtrinsics(false), q_ext(Eigen::Quaterniond::Identity()), t_ext(Eigen::Vector3d::Zero()),
-		hasDistortion(false), distortion{0, 0, 0, 0} {}
+		hasDistortion(false), distortion{0, 0, 0, 0}, hasCamera(false), camera() {}
 
 	/** @brief Returns the connected pose vertex.
 	*/
@@ -162,6 +163,12 @@ struct Edge : BaseEdge
 	// instead of pinhole: u = fx · X/Z + cx
 	bool hasDistortion;
 	double distortion[4];  //!< [k1, k2, k3, k4]
+
+	// Optional per-edge camera intrinsics. This is required for body-pose-centric
+	// multi-camera BA where one body pose vertex may feed observations from
+	// cameras with different fx/fy/cx/cy.
+	bool hasCamera;
+	CameraParams camera;
 };
 
 /** @brief Edge with 2-dimensional measurement (monocular observation).
@@ -214,6 +221,41 @@ struct PoseVertex
 	int id;                  //!< ID of the vertex.
 	int iP;                  //!< ID of the vertex (internally used).
 	Set<BaseEdge*> edges;    //!< connected edges.
+	Set<RelativePoseEdge*> relativePoseEdges; //!< connected pose-pose relative prior edges.
+};
+
+/** @brief Pose-pose relative prior edge for Full BA shape preservation.
+*/
+struct RelativePoseEdge
+{
+	using Rotation = Eigen::Quaterniond;
+	using Translation = Array<double, 3>;
+
+	/** @brief The constructor.
+	*/
+	RelativePoseEdge()
+		: fromVertex(nullptr), toVertex(nullptr), q_rel(Rotation::Identity()),
+		  t_rel(Translation::Zero()), translationInformation(0), rotationInformation(0) {}
+
+	/** @brief The constructor.
+	@param from connected source pose vertex.
+	@param to connected target pose vertex.
+	@param q measured relative rotation from source pose to target pose.
+	@param t measured relative translation from source pose to target pose.
+	@param translation_info translation information scalar.
+	@param rotation_info rotation information scalar.
+	*/
+	RelativePoseEdge(PoseVertex* from, PoseVertex* to, const Rotation& q, const Translation& t,
+		double translation_info, double rotation_info)
+		: fromVertex(from), toVertex(to), q_rel(q), t_rel(t),
+		  translationInformation(translation_info), rotationInformation(rotation_info) {}
+
+	PoseVertex* fromVertex;         //!< source pose vertex.
+	PoseVertex* toVertex;           //!< target pose vertex.
+	Rotation q_rel;                 //!< measured relative rotation.
+	Translation t_rel;              //!< measured relative translation.
+	double translationInformation;   //!< scalar weight for translation residual.
+	double rotationInformation;      //!< scalar weight for rotation residual.
 };
 
 /** @brief Landmark vertex struct.

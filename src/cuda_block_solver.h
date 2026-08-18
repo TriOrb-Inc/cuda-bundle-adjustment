@@ -42,14 +42,19 @@ void findHschureMulBlockIndices(const GpuHplBlockMat& Hpl, const GpuHscBlockMat&
 Scalar computeActiveErrors(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5d& cameras, const GpuVec3d& Xws,
 	const GpuVec2d& measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL,
 	const GpuVec4d& q_exts, const GpuVec3d& t_exts, const GpuVec4d& distortions,
+	const GpuVec5d& edge_cameras,
 	const RobustKernel& kernel,
 	GpuVec2d& errors, GpuVec3d& Xcs, Scalar* chi, long long* chi_int = nullptr);
 
 Scalar computeActiveErrors(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5d& cameras, const GpuVec3d& Xws,
 	const GpuVec3d& measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL,
-	const GpuVec4d& q_exts, const GpuVec3d& t_exts,
+	const GpuVec4d& q_exts, const GpuVec3d& t_exts, const GpuVec5d& edge_cameras,
 	const RobustKernel& kernel,
 	GpuVec3d& errors, GpuVec3d& Xcs, Scalar* chi, long long* chi_int = nullptr);
+
+Scalar computeRelativePosePriorErrors(const GpuVec4d& qs, const GpuVec3d& ts,
+	const GpuVec4i& edge2P, const GpuVec4d& measuredQs, const GpuVec3d& measuredTs,
+	const GpuVec2d& informations, GpuVec6d& errors, Scalar* chi, long long* chi_int = nullptr);
 
 // Option 4 Phase 2+: `Hpp_int_ext_raw` / `bp_int_ext_raw` / `Hll_int_raw` /
 // `bl_int_raw` / `HscDirect_int_raw` are pointers into `long long` buffers
@@ -74,6 +79,7 @@ void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVe
 	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1i& edge2HplExt,
 	const GpuVec1i& edge2ExtIP, const GpuVec1i& edge2HscPE, const GpuVec1b& flags,
 	const GpuVec4d& q_exts, const GpuVec3d& t_exts, const GpuVec4d& distortions,
+	const GpuVec5d& edge_cameras,
 	const RobustKernel& kernel,
 	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuHplBlockMat& Hpl,
 	GpuHscBlockMat& HscDirect,
@@ -87,7 +93,7 @@ void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVe
 void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVec5d& cameras, const GpuVec3d& errors,
 	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1i& edge2HplExt,
 	const GpuVec1i& edge2ExtIP, const GpuVec1i& edge2HscPE, const GpuVec1b& flags,
-	const GpuVec4d& q_exts, const GpuVec3d& t_exts,
+	const GpuVec4d& q_exts, const GpuVec3d& t_exts, const GpuVec5d& edge_cameras,
 	const RobustKernel& kernel,
 	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuHplBlockMat& Hpl,
 	GpuHscBlockMat& HscDirect,
@@ -97,6 +103,14 @@ void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVe
 	long long* bl_int_raw = nullptr,
 	long long* HscDirect_int_raw = nullptr,
 	long long* Hpl_ext_int_raw = nullptr);
+
+void constructRelativePosePriorQuadraticForm(const GpuVec4d& qs, const GpuVec3d& ts,
+	const GpuVec4d& measuredQs, const GpuVec3d& measuredTs, const GpuVec6d& errors,
+	const GpuVec4i& edge2P, const GpuVec2d& informations, const GpuVec1i& edge2Hsc,
+	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuHscBlockMat& HscDirect,
+	long long* Hpp_int_raw = nullptr,
+	long long* bp_int_raw = nullptr,
+	long long* HscDirect_int_raw = nullptr);
 
 // Option 4 Phase 2: copy the ext-range slots of a fixed-point int64 buffer
 // (`src_int`, sized identically to `Hpp.values()`) into the corresponding
@@ -201,11 +215,12 @@ void updatePoses(const GpuPx1BlockVec& xp, GpuVec4d& qs, GpuVec3d& ts, int num_b
 
 void computeChiSquares(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5d& cameras, const GpuVec3d& Xws,
 	const GpuVec2d& measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL,
-	const GpuVec4d& q_exts, const GpuVec3d& t_exts, const GpuVec4d& distortions, GpuVec1d& chiSqs);
+	const GpuVec4d& q_exts, const GpuVec3d& t_exts, const GpuVec4d& distortions,
+	const GpuVec5d& edge_cameras, GpuVec1d& chiSqs);
 
 void computeChiSquares(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5d& cameras, const GpuVec3d& Xws,
 	const GpuVec3d& measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL,
-	const GpuVec4d& q_exts, const GpuVec3d& t_exts, GpuVec1d& chiSqs);
+	const GpuVec4d& q_exts, const GpuVec3d& t_exts, const GpuVec5d& edge_cameras, GpuVec1d& chiSqs);
 
 Scalar maxDiagonal(const GpuPxPBlockVec& Hpp, Scalar* maxD);
 

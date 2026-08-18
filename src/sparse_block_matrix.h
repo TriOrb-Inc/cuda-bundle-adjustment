@@ -81,6 +81,9 @@ class HschurSparseBlockMatrix : public SparseBlockMatrix<PDIM, PDIM, ROW_MAJOR>
 public:
 
 	void constructFromVertices(const std::vector<VertexL*>& verticesL);
+	void constructFromVerticesAndRelativeEdges(
+		const std::vector<VertexL*>& verticesL,
+		const std::vector<RelativePoseEdge*>& relativePoseEdges);
 	void convertBSRToCSR();
 
 	const int* rowPtr() const { return rowPtr_.data(); }

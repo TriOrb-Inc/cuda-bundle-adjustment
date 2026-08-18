@@ -61,6 +61,10 @@ public:
 	*/
 	virtual void addStereoEdge(StereoEdge* e) = 0;
 
+	/** @brief Adds a pose-pose relative prior edge to the graph.
+	*/
+	virtual void addRelativePoseEdge(RelativePoseEdge* e) = 0;
+
 	/** @brief Returns the pose vertex with specified id.
 	*/
 	virtual PoseVertex* poseVertex(int id) const = 0;
