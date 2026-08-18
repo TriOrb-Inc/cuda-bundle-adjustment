@@ -805,6 +805,14 @@ public:
 
 			if (useDetAccum)
 			{
+				// Phase 3b: convert the body-range slots first (kernel writes
+				// body iP accumulations to [0, numBody) when the buffers are
+				// non-null). Phase 2/3a then propagates the ext-range slots
+				// [numBody, numBody+numExt). Together they cover the full
+				// [0, numBody+numExt) range and restore d_Hpp_ / d_bp_ to a
+				// consistent double view.
+				gpu::convertFixedPointHppBodyRange(d_Hpp_int_ext_ptr, d_Hpp_, numBody_);
+				gpu::convertFixedPointBpBodyRange(d_bp_int_ext_ptr, d_bp_, numBody_);
 				gpu::convertFixedPointHppExtRange(d_Hpp_int_ext_ptr, d_Hpp_, numBody_, numExt_);
 				gpu::convertFixedPointBpExtRange(d_bp_int_ext_ptr, d_bp_, numBody_, numExt_);
 			}
