@@ -623,6 +623,24 @@ public:
 					d_Hpl_ext_int_.resize(nHpl);
 				}
 
+				// Phase 3f: allocate fixed-point int64 mirrors for the Schur
+				// complement DEACCUM_ATOMIC sites (bsc in computeBschureKernel
+				// and Hsc in computeHschureKernel). These run on every LM
+				// iteration inside `solve()` so the gate is independent of
+				// extJoint_ — both body-only and joint-ext paths benefit from
+				// deterministic accumulation here. Sized from numP_ / d_Hsc_.
+				if (deterministicAccum_ && numP_ > 0)
+				{
+					d_bsc_int_.resize(static_cast<size_t>(numP_) *
+						static_cast<size_t>(PDIM));
+				}
+				if (deterministicAccum_ && d_Hsc_.nnz() > 0)
+				{
+					const size_t nHsc = static_cast<size_t>(d_Hsc_.nnz()) *
+						static_cast<size_t>(PDIM) * static_cast<size_t>(PDIM);
+					d_Hsc_int_.resize(nHsc);
+				}
+
 			d_HscCSR_.resize(Hsc_.nnzSymm());
 			d_BSR2CSR_.assign(Hsc_.nnzSymm(), (int*)Hsc_.BSR2CSR());
 
@@ -981,8 +999,40 @@ public:
 			// bSc = -bp + Hpl*Hll^-1*bl
 			// HSc = Hpp - Hpl*Hll^-1*HplT
 			////////////////////////////////////////////////////////////////////////////////////
-			gpu::computeBschure(d_bp_, d_Hpl_, d_Hll_, d_bl_, d_bsc_, d_invHll_, d_Hpl_invHll_);
-				gpu::computeHschure(d_Hpp_, d_HscDirect_, d_Hpl_invHll_, d_Hpl_, d_HscMulBlockIds_, d_Hsc_);
+			// Phase 3f: deterministic DEACCUM path for the Schur complement
+			// update. Gates run unconditionally when the mirror buffers are
+			// allocated (allocation itself is gated on deterministicAccum_
+			// in buildStructure). Caller contract: zero `src_int` before the
+			// kernel launch, then propagate additively into the double buffer
+			// after the kernel completes.
+			const bool useDetAccumBsc = deterministicAccum_ && d_bsc_int_.size() > 0;
+			const bool useDetAccumHsc = deterministicAccum_ && d_Hsc_int_.size() > 0;
+			long long* d_bsc_int_ptr = nullptr;
+			long long* d_Hsc_int_ptr = nullptr;
+			if (useDetAccumBsc)
+			{
+				d_bsc_int_.fillZero();
+				d_bsc_int_ptr = d_bsc_int_.data();
+			}
+			if (useDetAccumHsc)
+			{
+				d_Hsc_int_.fillZero();
+				d_Hsc_int_ptr = d_Hsc_int_.data();
+			}
+
+			gpu::computeBschure(d_bp_, d_Hpl_, d_Hll_, d_bl_, d_bsc_, d_invHll_, d_Hpl_invHll_,
+				d_bsc_int_ptr);
+				gpu::computeHschure(d_Hpp_, d_HscDirect_, d_Hpl_invHll_, d_Hpl_, d_HscMulBlockIds_, d_Hsc_,
+					d_Hsc_int_ptr);
+
+			if (useDetAccumBsc)
+			{
+				gpu::convertFixedPointBsc(d_bsc_int_ptr, d_bsc_, numP_);
+			}
+			if (useDetAccumHsc)
+			{
+				gpu::convertFixedPointHsc(d_Hsc_int_ptr, d_Hsc_, d_Hsc_.nnz());
+			}
 			trace_cuda_ba("solve schur complement end");
 
 			const auto t1 = get_time_point();
@@ -1303,7 +1353,20 @@ private:
 		// numExt_>0 && d_HscDirect_.nnz()>0. Size ==
 		// d_HscDirect_.nnz() * PDIM * PDIM.
 		DeviceBuffer<long long> d_HscDirect_int_;
+		// Option 4 Phase 3f: fixed-point int64 mirror of d_Hsc_.values() used
+		// for deterministic DEACCUM_ATOMIC inside `computeHschureKernel`
+		// (Schur-complement update `Hsc -= Hpl*invHll*HplT`). Allocated only
+		// when deterministicAccum_ && d_Hsc_.nnz()>0. Unlike Phase 3d this is
+		// active on both body-only and joint-ext paths (the Schur update runs
+		// unconditionally during `solve()`). Size == d_Hsc_.nnz() * PDIM * PDIM.
+		DeviceBuffer<long long> d_Hsc_int_;
 		GpuPx1BlockVec d_bsc_;
+		// Option 4 Phase 3f: fixed-point int64 mirror of d_bsc_.values() used
+		// for deterministic DEACCUM_ATOMIC inside `computeBschureKernel`
+		// (Schur RHS update `bsc -= Hpl*invHll*bl`). Allocated only when
+		// deterministicAccum_ && numP_>0, independent of ext-joint path.
+		// Size == numP_ * PDIM.
+		DeviceBuffer<long long> d_bsc_int_;
 	GpuLxLBlockVec d_invHll_;
 	GpuPxLBlockVec d_Hpl_invHll_;
 	GpuVec3i d_HscMulBlockIds_;

@@ -255,6 +255,35 @@ __device__ inline void MatMulMatT(const Scalar* A, const Scalar* B, Scalar* C)
 		MatMulVec<L, M, N, OP>(A, B + i, C + i * L);
 }
 
+// ---------------------------------------------------------------------------
+// Deterministic (fixed-point int64) variants of MatMulVec / MatMulMatT.
+// Used by Option 4 Phase 3f (Schur-complement update in computeBschureKernel /
+// computeHschureKernel). The legacy call sites use DEACCUM_ATOMIC, so these
+// deterministic variants take a signed `sign` multiplier (-1 replays the
+// legacy DEACCUM behavior); the dot product is scaled and accumulated via
+// `deterministic::atomicAccumDet` on an int64 buffer whose layout mirrors
+// the original Scalar output buffer (bsc: numP*PDIM; Hsc: nnz*PDIM*PDIM).
+// After kernel completion the caller invokes `convertFixedPoint*` helpers
+// to propagate the int64 increments additively back into the double buffer.
+// ---------------------------------------------------------------------------
+template <int M, int N, int S = 1>
+__device__ inline void MatMulVecDet(const Scalar* A, const Scalar* x,
+	long long* b_int, Scalar sign)
+{
+#pragma unroll
+	for (int i = 0; i < M; i++)
+		deterministic::atomicAccumDet(b_int + i, sign * dot_stride_<N, M, S>(A + i, x));
+}
+
+template <int L, int M, int N>
+__device__ inline void MatMulMatTDet(const Scalar* A, const Scalar* B,
+	long long* C_int, Scalar sign)
+{
+#pragma unroll
+	for (int i = 0; i < N; i++)
+		MatMulVecDet<L, M, N>(A, B + i, C_int + i * L, sign);
+}
+
 // squared L2 norm
 template <int N>
 __device__ inline Scalar squaredNorm(const Scalar* x) { return dot_<N>(x, x); }
@@ -1518,7 +1547,8 @@ __global__ void restoreDiagonalKernel(int size, Scalar* D, const Scalar* backup)
 
 __global__ void computeBschureKernel(int cols, LxLBlockPtr Hll, LxLBlockPtr invHll,
 	Lx1BlockPtr bl, PxLBlockPtr Hpl, const int* HplColPtr, const int* HplRowInd,
-	Px1BlockPtr bsc, PxLBlockPtr Hpl_invHll)
+	Px1BlockPtr bsc, PxLBlockPtr Hpl_invHll,
+	long long* bsc_int_raw)
 {
 	const int colId = blockIdx.x * blockDim.x + threadIdx.x;
 	if (colId >= cols)
@@ -1533,7 +1563,19 @@ __global__ void computeBschureKernel(int cols, LxLBlockPtr Hll, LxLBlockPtr invH
 	for (int i = HplColPtr[colId]; i < HplColPtr[colId + 1]; i++)
 	{
 		MatMulMat<6, 3, 3>(Hpl.at(i), iHll, Hpl_iHll);
-		MatMulVec<6, 3, 1, DEACCUM_ATOMIC>(Hpl_iHll, bl.at(colId), bsc.at(HplRowInd[i]));
+		if (bsc_int_raw != nullptr)
+		{
+			// Phase 3f: deterministic DEACCUM via fixed-point int64 atomics.
+			// The caller zeros `bsc_int_raw` before this launch and invokes
+			// `convertFixedPointBsc` afterwards to add the accumulated
+			// decrement back into the already-initialized double `bsc`.
+			MatMulVecDet<6, 3, 1>(Hpl_iHll, bl.at(colId),
+				bsc_int_raw + HplRowInd[i] * PDIM, Scalar(-1));
+		}
+		else
+		{
+			MatMulVec<6, 3, 1, DEACCUM_ATOMIC>(Hpl_iHll, bl.at(colId), bsc.at(HplRowInd[i]));
+		}
 		copy<PDIM * LDIM>(Hpl_iHll, Hpl_invHll.at(i));
 	}
 }
@@ -1548,7 +1590,8 @@ __global__ void initializeHschurKernel(int rows, PxPBlockPtr Hpp, PxPBlockPtr Hs
 }
 
 __global__ void computeHschureKernel(int size, const Vec3i* mulBlockIds,
-	PxLBlockPtr Hpl_invHll, PxLBlockPtr Hpl, PxPBlockPtr Hschur)
+	PxLBlockPtr Hpl_invHll, PxLBlockPtr Hpl, PxPBlockPtr Hschur,
+	long long* Hschur_int_raw)
 {
 	const int tid = blockIdx.x * blockDim.x + threadIdx.x;
 	if (tid >= size)
@@ -1563,7 +1606,19 @@ __global__ void computeHschureKernel(int size, const Vec3i* mulBlockIds,
 	Scalar B[PDIM * LDIM];
 	copy<PDIM * LDIM>(Hpl_invHll.at(index[0]), A);
 	copy<PDIM * LDIM>(Hpl.at(index[1]), B);
-	MatMulMatT<6, 3, 6, DEACCUM_ATOMIC>(A, B, Hschur.at(index[2]));
+	if (Hschur_int_raw != nullptr)
+	{
+		// Phase 3f: deterministic DEACCUM via fixed-point int64 atomics.
+		// Caller zeros `Hschur_int_raw` before this launch and invokes
+		// `convertFixedPointHsc` afterwards to add the accumulated
+		// decrement back into the already-initialized double `Hschur`.
+		MatMulMatTDet<6, 3, 6>(A, B,
+			Hschur_int_raw + index[2] * (PDIM * PDIM), Scalar(-1));
+	}
+	else
+	{
+		MatMulMatT<6, 3, 6, DEACCUM_ATOMIC>(A, B, Hschur.at(index[2]));
+	}
 }
 
 __global__ void findHschureMulBlockIndicesKernel(int cols, const int* HplColPtr, const int* HplRowInd,
@@ -2182,21 +2237,29 @@ void restoreDiagonal(GpuLxLBlockVec& Hll, const GpuLx1BlockVec& backup)
 }
 
 void computeBschure(const GpuPx1BlockVec& bp, const GpuHplBlockMat& Hpl, const GpuLxLBlockVec& Hll,
-	const GpuLx1BlockVec& bl, GpuPx1BlockVec& bsc, GpuLxLBlockVec& invHll, GpuPxLBlockVec& Hpl_invHll)
+	const GpuLx1BlockVec& bl, GpuPx1BlockVec& bsc, GpuLxLBlockVec& invHll, GpuPxLBlockVec& Hpl_invHll,
+	long long* bsc_int_raw)
 {
 	prepareCudaThreadContext();
 	const int cols = Hll.size();
 	const int block = 256;
 	const int grid = divUp(cols, block);
 
+	// Phase 3f note: When the deterministic path is active, the caller must
+	// zero `bsc_int_raw` prior to this call. `bp.copyTo(bsc)` initializes the
+	// double buffer with the initial bp contribution; the kernel accumulates
+	// only the Hpl*invHll*bl decrement into `bsc_int_raw`, and the matching
+	// `convertFixedPointBsc` call adds the fixed-point decrement back into
+	// `bsc` (additive propagate).
 	bp.copyTo(bsc);
 	computeBschureKernel<<<grid, block>>>(cols, Hll, invHll, bl, Hpl, Hpl.outerIndices(), Hpl.innerIndices(),
-		bsc, Hpl_invHll);
+		bsc, Hpl_invHll, bsc_int_raw);
 	CUDA_CHECK(cudaGetLastError());
 }
 
 void computeHschure(const GpuPxPBlockVec& Hpp, const GpuHscBlockMat& HscDirect, const GpuPxLBlockVec& Hpl_invHll,
-	const GpuHplBlockMat& Hpl, const GpuVec3i& mulBlockIds, GpuHscBlockMat& Hsc)
+	const GpuHplBlockMat& Hpl, const GpuVec3i& mulBlockIds, GpuHscBlockMat& Hsc,
+	long long* Hschur_int_raw)
 {
 	prepareCudaThreadContext();
 	const int nmulBlocks = mulBlockIds.ssize();
@@ -2204,11 +2267,62 @@ void computeHschure(const GpuPxPBlockVec& Hpp, const GpuHscBlockMat& HscDirect, 
 	const int grid1 = divUp(Hsc.rows(), block);
 	const int grid2 = divUp(nmulBlocks, block);
 
+	// Phase 3f note: The pre-kernel initialization of `Hsc` (cudaMemcpy from
+	// HscDirect, then Hpp-diagonal add) is deterministic on its own (no
+	// atomics on overlapping addresses). Only the subsequent Schur complement
+	// update via `computeHschureKernel` uses DEACCUM_ATOMIC; when
+	// `Hschur_int_raw` is non-null, that update is routed through int64
+	// accumulation and the paired `convertFixedPointHsc` helper adds the
+	// fixed-point decrement back into `Hsc` after the kernel completes.
 	CUDA_CHECK(cudaMemcpy(Hsc.values(), HscDirect.values(),
 		sizeof(Scalar) * Hsc.nnz() * GpuHscBlockMat::BLOCK_AREA,
 		cudaMemcpyDeviceToDevice));
 	initializeHschurKernel<<<grid1, block>>>(Hsc.rows(), Hpp, Hsc, Hsc.outerIndices());
-	computeHschureKernel<<<grid2, block>>>(nmulBlocks, mulBlockIds, Hpl_invHll, Hpl, Hsc);
+	computeHschureKernel<<<grid2, block>>>(nmulBlocks, mulBlockIds, Hpl_invHll, Hpl, Hsc, Hschur_int_raw);
+	CUDA_CHECK(cudaGetLastError());
+}
+
+// Phase 3f: additive propagation from fixed-point int64 buffer back into the
+// double `bsc` vector. The double `bsc` already holds `bp.copyTo(bsc)` at
+// call time, so this helper performs `bsc[i] += fromFixedPoint(src_int[i])`
+// over `numP*PDIM` entries to complete the deterministic DEACCUM.
+__global__ void fixedPointAddToDoubleBscKernel(int n,
+	const long long* src_int, Scalar* dst)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	dst[i] += deterministic::fromFixedPoint(src_int[i]);
+}
+
+void convertFixedPointBsc(const long long* src_int, GpuPx1BlockVec& bsc, int numP)
+{
+	if (numP <= 0) return;
+	const int n = numP * PDIM;
+	const int block = 1024;
+	const int grid = divUp(n, block);
+	fixedPointAddToDoubleBscKernel<<<grid, block>>>(n, src_int, bsc.values());
+	CUDA_CHECK(cudaGetLastError());
+}
+
+// Phase 3f: additive propagation from fixed-point int64 buffer back into the
+// double `Hsc` block matrix. `Hsc.values()` already holds `HscDirect + Hpp`
+// diagonal at call time; this helper adds the accumulated Schur-complement
+// decrement `-Hpl*invHll*HplT` over `nnz*PDIM*PDIM` entries.
+__global__ void fixedPointAddToDoubleHscKernel(int n,
+	const long long* src_int, Scalar* dst)
+{
+	const int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	dst[i] += deterministic::fromFixedPoint(src_int[i]);
+}
+
+void convertFixedPointHsc(const long long* src_int, GpuHscBlockMat& Hsc, int nnz)
+{
+	if (nnz <= 0) return;
+	const int n = nnz * GpuHscBlockMat::BLOCK_AREA;
+	const int block = 1024;
+	const int grid = divUp(n, block);
+	fixedPointAddToDoubleHscKernel<<<grid, block>>>(n, src_int, Hsc.values());
 	CUDA_CHECK(cudaGetLastError());
 }
 
