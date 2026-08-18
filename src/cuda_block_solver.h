@@ -45,19 +45,21 @@ Scalar computeActiveErrors(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5
 	const RobustKernel& kernel,
 	GpuVec3d& errors, GpuVec3d& Xcs, Scalar* chi);
 
-// Option 4 Phase 2+: `Hpp_int_ext_raw` / `bp_int_ext_raw` are pointers into
-// `long long` buffers that mirror the layouts of `Hpp.values()` and
-// `bp.values()` respectively. When non-null, the kernel routes the
-// `Hpp.at(iPExt)` block / `bp.at(iPExt)` vector accumulations through a
-// fixed-point int64 atomicAdd path so the final values are bit-identical
-// across runs. The caller is responsible for (a) zeroing each buffer before
-// this call and (b) invoking `convertFixedPointHppExtRange` /
-// `convertFixedPointBpExtRange` after the call to propagate the ext-range
-// slots back into the double `Hpp` / `bp` buffers. When null, the legacy
+// Option 4 Phase 2+: `Hpp_int_ext_raw` / `bp_int_ext_raw` / `Hll_int_raw` /
+// `bl_int_raw` are pointers into `long long` buffers that mirror the layouts
+// of `Hpp.values()`, `bp.values()`, `Hll.values()`, and `bl.values()`
+// respectively. When non-null, the kernel routes the corresponding block /
+// vector accumulations through a fixed-point int64 atomicAdd path so the
+// final values are bit-identical across runs. The caller is responsible for
+// (a) zeroing each buffer before this call and (b) invoking the paired
+// `convertFixedPoint*Range` helpers after the call to propagate slots back
+// into the double `Hpp` / `bp` / `Hll` / `bl` buffers. When null, the legacy
 // `atomicAdd(double*)` path is used, preserving the pre-Phase-2 behavior.
-// Phase 3a adds `bp_int_ext_raw`; remaining atomic sites (`Hpp.at(iP)`,
-// `Hll`, `bp.at(iP)`, `bl`, `HscDirect`, `Hpl.at(hplExtSlot)`, Schur update)
-// will be migrated in Phase 3b+.
+// Phase 3a adds `bp_int_ext_raw`; Phase 3b adds body-range conversion through
+// the same `Hpp_int_ext_raw` / `bp_int_ext_raw` buffers; Phase 3c adds
+// `Hll_int_raw` / `bl_int_raw` for the full landmark range. Remaining atomic
+// sites (`HscDirect`, `Hpl.at(hplExtSlot)`, Schur update) will be migrated in
+// Phase 3d+.
 void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVec5d& cameras, const GpuVec2d& errors,
 	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1i& edge2HplExt,
 	const GpuVec1i& edge2ExtIP, const GpuVec1i& edge2HscPE, const GpuVec1b& flags,
@@ -66,7 +68,9 @@ void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVe
 	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuHplBlockMat& Hpl,
 	GpuHscBlockMat& HscDirect,
 	long long* Hpp_int_ext_raw = nullptr,
-	long long* bp_int_ext_raw = nullptr);
+	long long* bp_int_ext_raw = nullptr,
+	long long* Hll_int_raw = nullptr,
+	long long* bl_int_raw = nullptr);
 
 void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVec5d& cameras, const GpuVec3d& errors,
 	const GpuVec1d& omegas, const GpuVec2i& edge2PL, const GpuVec1i& edge2Hpl, const GpuVec1i& edge2HplExt,
@@ -76,7 +80,9 @@ void constructQuadraticForm(const GpuVec3d& Xcs, const GpuVec4d& qs, const GpuVe
 	GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuHplBlockMat& Hpl,
 	GpuHscBlockMat& HscDirect,
 	long long* Hpp_int_ext_raw = nullptr,
-	long long* bp_int_ext_raw = nullptr);
+	long long* bp_int_ext_raw = nullptr,
+	long long* Hll_int_raw = nullptr,
+	long long* bl_int_raw = nullptr);
 
 // Option 4 Phase 2: copy the ext-range slots of a fixed-point int64 buffer
 // (`src_int`, sized identically to `Hpp.values()`) into the corresponding
@@ -103,6 +109,18 @@ void convertFixedPointHppBodyRange(const long long* src_int,
 
 void convertFixedPointBpBodyRange(const long long* src_int,
 	GpuPx1BlockVec& bp, int numBody);
+
+// Option 4 Phase 3c: copy the landmark-range slots of a fixed-point int64
+// buffer (`src_int`, sized identically to `Hll.values()` / `bl.values()`) into
+// the corresponding double slots. Touches `[0, numL)` slots — each block is
+// LDIM*LDIM scalars for Hll, LDIM scalars for bl. Landmark slots are disjoint
+// from Hpp / bp so these helpers can be called independently of the body /
+// ext helpers above.
+void convertFixedPointHllRange(const long long* src_int,
+	GpuLxLBlockVec& Hll, int numL);
+
+void convertFixedPointBlRange(const long long* src_int,
+	GpuLx1BlockVec& bl, int numL);
 
 // Build per-edge ext Hpl slot vector. For each edge e:
 //   edge2HplExt[e] = (dedup_slot[e] < 0) ? -1 : edge2Hpl[nedges_total + dedup_slot[e]]
