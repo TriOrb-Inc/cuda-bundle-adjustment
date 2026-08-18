@@ -33,17 +33,23 @@ void buildHplStructure(GpuVec3i& blockpos, GpuHplBlockMat& Hpl, GpuVec1i& indexP
 void findHschureMulBlockIndices(const GpuHplBlockMat& Hpl, const GpuHscBlockMat& Hsc,
 	GpuVec3i& mulBlockIds);
 
+// Option 4 Phase 3g: optional `chi_int` int64 buffer for deterministic final
+// reduction. When non-null, the helper zeroes the buffer, launches the kernel
+// with the int64 accumulator path, memcpys the result back to host, and
+// converts via `fromFixedPoint`. The legacy double `chi` buffer is still
+// zeroed/passed for backwards-compat inside the kernel. When null, the legacy
+// `atomicAdd(double*)` path is preserved bit-for-bit.
 Scalar computeActiveErrors(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5d& cameras, const GpuVec3d& Xws,
 	const GpuVec2d& measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL,
 	const GpuVec4d& q_exts, const GpuVec3d& t_exts, const GpuVec4d& distortions,
 	const RobustKernel& kernel,
-	GpuVec2d& errors, GpuVec3d& Xcs, Scalar* chi);
+	GpuVec2d& errors, GpuVec3d& Xcs, Scalar* chi, long long* chi_int = nullptr);
 
 Scalar computeActiveErrors(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5d& cameras, const GpuVec3d& Xws,
 	const GpuVec3d& measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL,
 	const GpuVec4d& q_exts, const GpuVec3d& t_exts,
 	const RobustKernel& kernel,
-	GpuVec3d& errors, GpuVec3d& Xcs, Scalar* chi);
+	GpuVec3d& errors, GpuVec3d& Xcs, Scalar* chi, long long* chi_int = nullptr);
 
 // Option 4 Phase 2+: `Hpp_int_ext_raw` / `bp_int_ext_raw` / `Hll_int_raw` /
 // `bl_int_raw` / `HscDirect_int_raw` are pointers into `long long` buffers
@@ -243,7 +249,14 @@ void updatePoses(const GpuPx1BlockVec& xp, GpuVec4d& qs, GpuVec3d& ts);
 
 void updateLandmarks(const GpuLx1BlockVec& xl, GpuVec3d& Xws);
 
-void computeScale(const GpuVec1d& x, const GpuVec1d& b, Scalar* scale, Scalar lambda);
+// Option 4 Phase 3g: when `scale_int` is non-null, the helper reduces into a
+// deterministic int64 accumulator and returns `fromFixedPoint(result)`.
+// Otherwise preserves the legacy double path and returns the double scalar.
+// The legacy signature (returning `void` and requiring the caller to download
+// `scale`) was replaced to unify the chi / scale read-back paths; the only
+// external caller (`cuda_bundle_adjustment.cpp`) was updated accordingly.
+Scalar computeScale(const GpuVec1d& x, const GpuVec1d& b, Scalar* scale, Scalar lambda,
+	long long* scale_int = nullptr);
 
 void solveDiagonalSystem(const GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuPx1BlockVec& xp);
 

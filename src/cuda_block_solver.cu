@@ -19,6 +19,8 @@ limitations under the License.
 #include <algorithm>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#include <stdexcept>
+#include <string>
 
 #include <thrust/device_ptr.h>
 #include <thrust/scan.h>
@@ -68,7 +70,11 @@ struct LessRowId
 	__device__ bool operator()(const Vec3i& lhs, const Vec3i& rhs) const
 	{
 		if (lhs[0] == rhs[0])
+		{
+			if (lhs[1] == rhs[1])
+				return lhs[2] < rhs[2];
 			return lhs[1] < rhs[1];
+		}
 		return lhs[0] < rhs[0];
 	}
 };
@@ -78,7 +84,11 @@ struct LessColId
 	__device__ bool operator()(const Vec3i& lhs, const Vec3i& rhs) const
 	{
 		if (lhs[1] == rhs[1])
+		{
+			if (lhs[0] == rhs[0])
+				return lhs[2] < rhs[2];
 			return lhs[0] < rhs[0];
+		}
 		return lhs[1] < rhs[1];
 	}
 };
@@ -1018,7 +1028,12 @@ template <int MDIM, int RK_TYPE>
 __global__ void computeActiveErrorsKernel(int nedges, const Vec4d* qs, const Vec3d* ts, const Vec5d* cameras,
 	const Vec3d* Xws, const Vecxd<MDIM>* measurements, const Scalar* omegas, const Vec2i* edge2PL,
 	const Vec4d* q_exts, const Vec3d* t_exts, const Vec4d* distortions,
-	RobustKernelFunc<RK_TYPE> robustKernel, Vecxd<MDIM>* errors, Vec3d* Xcs, Scalar* chi)
+	RobustKernelFunc<RK_TYPE> robustKernel, Vecxd<MDIM>* errors, Vec3d* Xcs, Scalar* chi,
+	// Option 4 Phase 3g: when non-null, the final reduction writes into a
+	// fixed-point int64 accumulator instead of the double `chi` buffer. This
+	// eliminates the last `atomicAdd(double*)` site on the LM error-evaluation
+	// path so `rho = (F - Fhat) / scale` becomes fully bit-identical.
+	long long* chi_int)
 {
 	using Vecmd = Vecxd<MDIM>;
 
@@ -1086,7 +1101,12 @@ __global__ void computeActiveErrorsKernel(int nedges, const Vec4d* qs, const Vec
 	}
 
 	if (sharedIdx == 0)
-		atomicAdd(chi, cache[0]);
+	{
+		if (chi_int != nullptr)
+			deterministic::atomicAccumDet(chi_int, cache[0]);
+		else
+			atomicAdd(chi, cache[0]);
+	}
 }
 
 template <int MDIM, int RK_TYPE>
@@ -1622,7 +1642,8 @@ __global__ void computeHschureKernel(int size, const Vec3i* mulBlockIds,
 }
 
 __global__ void findHschureMulBlockIndicesKernel(int cols, const int* HplColPtr, const int* HplRowInd,
-	const int* HscRowPtr, const int* HscColInd, Vec3i* mulBlockIds, int* nindices)
+	const int* HscRowPtr, const int* HscColInd, Vec3i* mulBlockIds, int* nindices,
+	int mulBlockCapacity, int* overflow)
 {
 	const int colId = blockIdx.x * blockDim.x + threadIdx.x;
 	if (colId >= cols)
@@ -1649,12 +1670,26 @@ __global__ void findHschureMulBlockIndicesKernel(int cols, const int* HplColPtr,
 				// computeHschureKernel can skip this multiplication instead of
 				// scattering into an unrelated block.
 				const int pos = atomicAdd(nindices, 1);
-				mulBlockIds[pos] = makeVec3i(i, j, -1);
+				if (pos < mulBlockCapacity)
+				{
+					mulBlockIds[pos] = makeVec3i(i, j, -1);
+				}
+				else
+				{
+					atomicExch(overflow, 1);
+				}
 			}
 			else
 			{
 				const int pos = atomicAdd(nindices, 1);
-				mulBlockIds[pos] = makeVec3i(i, j, k);
+				if (pos < mulBlockCapacity)
+				{
+					mulBlockIds[pos] = makeVec3i(i, j, k);
+				}
+				else
+				{
+					atomicExch(overflow, 1);
+				}
 			}
 		}
 	}
@@ -1818,7 +1853,13 @@ __global__ void updateLandmarksKernel(int size, Lx1BlockPtr xl, Vec3d* Xws)
 	Xw[2] += dXw[2];
 }
 
-__global__ void computeScaleKernel(const Scalar* x, const Scalar* b, Scalar* scale, Scalar lambda, int size)
+__global__ void computeScaleKernel(const Scalar* x, const Scalar* b, Scalar* scale, Scalar lambda, int size,
+	// Option 4 Phase 3g: deterministic fixed-point accumulator mirror, same
+	// shape as `chi_int` in computeActiveErrorsKernel. When non-null, the
+	// final block-reduced scalar is routed through `atomicAccumDet` instead
+	// of `atomicAdd(double*)` so the LM denominator (`scale + 1e-3`) becomes
+	// bit-identical across runs.
+	long long* scale_int)
 {
 	const int sharedIdx = threadIdx.x;
 	__shared__ Scalar cache[BLOCK_COMPUTE_SCALE];
@@ -1838,7 +1879,12 @@ __global__ void computeScaleKernel(const Scalar* x, const Scalar* b, Scalar* sca
 	}
 
 	if (sharedIdx == 0)
-		atomicAdd(scale, cache[0]);
+	{
+		if (scale_int != nullptr)
+			deterministic::atomicAccumDet(scale_int, cache[0]);
+		else
+			atomicAdd(scale, cache[0]);
+	}
 }
 
 __global__ void convertBSRToCSRKernel(int size, const Scalar* src, Scalar* dst, const int* map)
@@ -1918,7 +1964,11 @@ void buildHplStructure(GpuVec3i& blockpos, GpuHplBlockMat& Hpl, GpuVec1i& indexP
 	int* rowInd = Hpl.innerIndices();
 
 	auto ptrBlockPos = thrust::device_pointer_cast(blockpos.data());
-	thrust::sort(ptrBlockPos, ptrBlockPos + nblocks, LessColId());
+	// Option 4 Phase 5: duplicate Hpl slots are valid when multiple edges contribute
+	// to the same (row, col) block. Sort by a total (col, row, edgeId) key so the
+	// per-edge `indexPL[edgeId] = k` mapping does not depend on Thrust's handling of
+	// equivalent keys or on the launch order that produced the block list.
+	thrust::stable_sort(ptrBlockPos, ptrBlockPos + nblocks, LessColId());
 
 	CUDA_CHECK(cudaMemset(nnzPerCol, 0, sizeof(int) * (Hpl.cols() + 1)));
 	nnzPerColKernel<<<grid, block>>>(blockpos, nblocks, nnzPerCol);
@@ -1930,30 +1980,48 @@ void findHschureMulBlockIndices(const GpuHplBlockMat& Hpl, const GpuHscBlockMat&
 	GpuVec3i& mulBlockIds)
 {
 	prepareCudaThreadContext();
+	const int mulBlockCapacity = mulBlockIds.ssize();
+	if (Hpl.cols() <= 0 || mulBlockCapacity <= 0)
+	{
+		return;
+	}
 	const int block = 1024;
 	const int grid = divUp(Hpl.cols(), block);
 
 	DeviceBuffer<int> nindices(1);
 	nindices.fillZero();
+	DeviceBuffer<int> overflow(1);
+	overflow.fillZero();
 
 	// Initialize every Vec3i slot to (-1, -1, -1) before the kernel populates a
-	// prefix of the buffer via atomicAdd(nindices, 1). The buffer is sized for
-	// the upper bound nmultiplies_ (including duplicate enumeration of indices in
-	// constructFromVertices), but the kernel only writes one slot per unique Hpl
-	// (iP1, iP2) pair for each landmark column, which is <= nmultiplies_. Joint
-	// ext mode makes this gap real: computeHschureKernel would otherwise scatter
-	// into random Hschur/Hpl blocks for the tail entries. Writing 0xFF bytes
-	// across the entire buffer sets each int to -1, which the sentinel check in
-	// computeHschureKernel (index[2] < 0) skips.
+	// prefix of the buffer via atomicAdd(nindices, 1). The caller sizes the buffer
+	// from the actual Hpl row-slot pair enumeration per landmark column, not from
+	// Hsc_.nmulBlocks(), because Hsc stores unique Schur row pairs while Hpl can
+	// contain duplicate row slots introduced by multi-camera / joint-ext edges.
+	// Writing 0xFF bytes across the entire buffer sets each int to -1, which the
+	// sentinel check in computeHschureKernel (index[2] < 0) skips.
 	CUDA_CHECK(cudaMemset(mulBlockIds.data(), 0xFF,
 		sizeof(Vec3i) * mulBlockIds.size()));
 
 	findHschureMulBlockIndicesKernel<<<grid, block>>>(Hpl.cols(), Hpl.outerIndices(), Hpl.innerIndices(),
-		Hsc.outerIndices(), Hsc.innerIndices(), mulBlockIds, nindices);
+		Hsc.outerIndices(), Hsc.innerIndices(), mulBlockIds, nindices, mulBlockCapacity, overflow);
 	CUDA_CHECK(cudaGetLastError());
+	int hostNindices = 0;
+	int hostOverflow = 0;
+	nindices.download(&hostNindices);
+	overflow.download(&hostOverflow);
+	if (hostOverflow != 0 || hostNindices > mulBlockCapacity)
+	{
+		throw std::runtime_error(
+			"findHschureMulBlockIndices overflow: writes=" + std::to_string(hostNindices) +
+			", capacity=" + std::to_string(mulBlockCapacity));
+	}
 
 	auto ptrSrc = thrust::device_pointer_cast(mulBlockIds.data());
-	thrust::sort(ptrSrc, ptrSrc + mulBlockIds.size(), LessRowId());
+	// Option 4 Phase 5: use a total (row, col, hplPairSlot) order. The kernel writes
+	// the prefix through atomicAdd(nindices, 1), so preserving equivalent-key prefix
+	// order is not sufficient for deterministic Schur construction.
+	thrust::stable_sort(ptrSrc, ptrSrc + mulBlockIds.size(), LessRowId());
 }
 
 template <int MDIM, int RK_TYPE = 0>
@@ -1961,7 +2029,7 @@ Scalar computeActiveErrors_(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec
 	const GpuVecAny& _measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL,
 	const GpuVec4d& q_exts, const GpuVec3d& t_exts, const GpuVec4d& distortions,
 	Scalar robustDelta,
-	const GpuVecAny& _errors, GpuVec3d& Xcs, Scalar* chi)
+	const GpuVecAny& _errors, GpuVec3d& Xcs, Scalar* chi, long long* chi_int)
 {
 	prepareCudaThreadContext();
 	const auto& measurements = _measurements.getCRef<Vecxd<MDIM>>();
@@ -1979,10 +2047,23 @@ Scalar computeActiveErrors_(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec
 	const Vec4d* d_dist_ptr = (MDIM == 2 && distortions.size() > 0)
 		? static_cast<const Vec4d*>(distortions) : nullptr;
 
+	// Option 4 Phase 3g: when `chi_int` is provided, route the final reduction
+	// through the deterministic int64 accumulator. The legacy `chi` double
+	// buffer is still zeroed/read for callers that haven't migrated (and as a
+	// no-op guard in case the kernel hits the double branch).
+	if (chi_int != nullptr)
+		CUDA_CHECK(cudaMemset(chi_int, 0, sizeof(long long)));
 	CUDA_CHECK(cudaMemset(chi, 0, sizeof(Scalar)));
 	computeActiveErrorsKernel<MDIM, RK_TYPE><<<grid, block>>>(nedges, qs, ts, cameras, Xws, measurements, omegas,
-		edge2PL, q_exts, t_exts, d_dist_ptr, robustKernel, errors, Xcs, chi);
+		edge2PL, q_exts, t_exts, d_dist_ptr, robustKernel, errors, Xcs, chi, chi_int);
 	CUDA_CHECK(cudaGetLastError());
+
+	if (chi_int != nullptr)
+	{
+		long long h_chi_int = 0;
+		CUDA_CHECK(cudaMemcpy(&h_chi_int, chi_int, sizeof(long long), cudaMemcpyDeviceToHost));
+		return deterministic::fromFixedPoint(h_chi_int);
+	}
 
 	Scalar h_chi = 0;
 	CUDA_CHECK(cudaMemcpy(&h_chi, chi, sizeof(Scalar), cudaMemcpyDeviceToHost));
@@ -1992,7 +2073,7 @@ Scalar computeActiveErrors_(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec
 
 using ComputeActiveErrorsFunc = Scalar(*)(const GpuVec4d&, const GpuVec3d&, const GpuVec5d&, const GpuVec3d&,
 	const GpuVecAny&, const GpuVec1d&, const GpuVec2i&, const GpuVec4d&, const GpuVec3d&, const GpuVec4d&,
-	Scalar, const GpuVecAny&, GpuVec3d&, Scalar*);
+	Scalar, const GpuVecAny&, GpuVec3d&, Scalar*, long long*);
 
 static ComputeActiveErrorsFunc computeActiveErrorsFuncs[6] =
 {
@@ -2008,22 +2089,22 @@ Scalar computeActiveErrors(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5
 	const GpuVec2d& measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL,
 	const GpuVec4d& q_exts, const GpuVec3d& t_exts, const GpuVec4d& distortions,
 	const RobustKernel& kernel,
-	GpuVec2d& errors, GpuVec3d& Xcs, Scalar* chi)
+	GpuVec2d& errors, GpuVec3d& Xcs, Scalar* chi, long long* chi_int)
 {
 	auto func = computeActiveErrorsFuncs[0 + kernel.type];
-	return func(qs, ts, cameras, Xws, measurements, omegas, edge2PL, q_exts, t_exts, distortions, kernel.delta, errors, Xcs, chi);
+	return func(qs, ts, cameras, Xws, measurements, omegas, edge2PL, q_exts, t_exts, distortions, kernel.delta, errors, Xcs, chi, chi_int);
 }
 
 Scalar computeActiveErrors(const GpuVec4d& qs, const GpuVec3d& ts, const GpuVec5d& cameras, const GpuVec3d& Xws,
 	const GpuVec3d& measurements, const GpuVec1d& omegas, const GpuVec2i& edge2PL,
 	const GpuVec4d& q_exts, const GpuVec3d& t_exts,
 	const RobustKernel& kernel,
-	GpuVec3d& errors, GpuVec3d& Xcs, Scalar* chi)
+	GpuVec3d& errors, GpuVec3d& Xcs, Scalar* chi, long long* chi_int)
 {
 	// 3D (stereo) path: no distortion support, pass empty GpuVec4d
 	static GpuVec4d empty_distortions;
 	auto func = computeActiveErrorsFuncs[3 + kernel.type];
-	return func(qs, ts, cameras, Xws, measurements, omegas, edge2PL, q_exts, t_exts, empty_distortions, kernel.delta, errors, Xcs, chi);
+	return func(qs, ts, cameras, Xws, measurements, omegas, edge2PL, q_exts, t_exts, empty_distortions, kernel.delta, errors, Xcs, chi, chi_int);
 }
 
 template <int MDIM, int RK_TYPE = 0>
@@ -2654,15 +2735,32 @@ void updateLandmarks(const GpuLx1BlockVec& xl, GpuVec3d& Xws)
 	CUDA_CHECK(cudaGetLastError());
 }
 
-void computeScale(const GpuVec1d& x, const GpuVec1d& b, Scalar* scale, Scalar lambda)
+Scalar computeScale(const GpuVec1d& x, const GpuVec1d& b, Scalar* scale, Scalar lambda, long long* scale_int)
 {
 	prepareCudaThreadContext();
 	const int block = BLOCK_COMPUTE_SCALE;
 	const int grid = 4;
 
+	// Option 4 Phase 3g: mirror the pattern from computeActiveErrors_ — when
+	// `scale_int` is provided, route the reduction through the deterministic
+	// int64 accumulator and read the result back to host, converting via
+	// `fromFixedPoint`. Otherwise preserve the legacy double path.
+	if (scale_int != nullptr)
+		CUDA_CHECK(cudaMemset(scale_int, 0, sizeof(long long)));
 	CUDA_CHECK(cudaMemset(scale, 0, sizeof(Scalar)));
-	computeScaleKernel<<<grid, block>>>(x, b, scale, lambda, x.ssize());
+	computeScaleKernel<<<grid, block>>>(x, b, scale, lambda, x.ssize(), scale_int);
 	CUDA_CHECK(cudaGetLastError());
+
+	if (scale_int != nullptr)
+	{
+		long long h_scale_int = 0;
+		CUDA_CHECK(cudaMemcpy(&h_scale_int, scale_int, sizeof(long long), cudaMemcpyDeviceToHost));
+		return deterministic::fromFixedPoint(h_scale_int);
+	}
+
+	Scalar h_scale = 0;
+	CUDA_CHECK(cudaMemcpy(&h_scale, scale, sizeof(Scalar), cudaMemcpyDeviceToHost));
+	return h_scale;
 }
 
 void solveDiagonalSystem(const GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuLx1BlockVec& xl)
