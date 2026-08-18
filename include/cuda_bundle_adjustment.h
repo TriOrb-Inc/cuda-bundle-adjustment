@@ -101,6 +101,20 @@ public:
 	*/
 	virtual void setRobustKernels(RobustKernelType kernelType, double delta, EdgeType edgeType) = 0;
 
+	/** @brief Enables deterministic atomic accumulation on the joint extrinsics path.
+
+	When enabled, the Hpp[iPExt] block accumulation inside `buildSystem()` routes through a
+	fixed-point int64 atomicAdd buffer (see `deterministic_atomics.cuh`) and is converted back
+	to double after each LM iteration. This makes the ext-range Hpp slots bit-identical across
+	runs. The flag only has effect when joint extrinsics optimization is active
+	(`TRIORB_OPTIMIZE_EXTRINSICS_JOINT=1`); otherwise it is a no-op.
+
+	Default: disabled (legacy non-deterministic `atomicAdd(double*)` path).
+
+	@param enabled true to enable the deterministic path.
+	*/
+	virtual void setDeterministicAccum(bool enabled) = 0;
+
 	/** @brief Initializes the graph.
 	*/
 	virtual void initialize() = 0;
