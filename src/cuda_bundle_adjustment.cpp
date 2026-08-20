@@ -46,6 +46,51 @@ bool is_cuda_ba_trace_enabled()
 	return env_value != nullptr && std::string(env_value) == "1";
 }
 
+// Relative chi2 gain below which the solve is treated as converged.
+// Opt-in: `TRIORB_CUDA_BA_GAIN_THRESHOLD=1e-3` enables it, default is off.
+//
+// Why it exists. The LM loop has no convergence stop, so it keeps demanding
+// improvement from an already-converged problem: rho goes negative, lambda is
+// multiplied by nu (2, 4, 8, ... up to maxq times per iteration) and reaches
+// ~1e19 within a few iterations. Measured on a real 4-camera local BA: lambda
+// climbed to 3.93e19 at iteration 13 and every landmark position came back NaN.
+//
+// That NaN was a float32 overflow inside `Sym3x3Inv` (see the comment there),
+// not an inherent property of large lambda -- the same block inverts fine in
+// double, and now inverts fine in float too because the block is scaled before
+// the determinant is formed. Keeping lambda out of that range is therefore no
+// longer required for correctness; this threshold only bounds how far LM will
+// chase a converged problem.
+//
+// Why it is off by default. It measured *worse* on the one dataset available
+// (BOAR-NEDO-01 083033, 3 runs each):
+//
+//   on  (1e-3): closure 0.3057 m x3 (bit-identical), kf 110, iter p50 12,
+//               lambda max 2.57e12
+//   off:        closure 0.2754 / 0.2798 / 0.2754 m, kf 112, iter p50 15,
+//               lambda max 5.15e24
+//
+// The 0.030 m gap sits outside the off-run spread (0.0044 m), so the
+// regression is real: the tiny high-lambda steps LM takes after nominal
+// convergence do buy a little accuracy. The on-runs being bit-identical is a
+// genuinely interesting property for load-invariance work, but it needs
+// evidence from more datasets before it can justify the accuracy cost.
+//
+// Formula matches g2o's SparseOptimizerTerminateAction, which stella_vslam
+// runs at 1e-3.
+double cuda_ba_gain_threshold()
+{
+	const char* env_value = std::getenv("TRIORB_CUDA_BA_GAIN_THRESHOLD");
+	if (env_value == nullptr)
+		return 0.0;
+	try {
+		const double parsed = std::stod(env_value);
+		return std::isfinite(parsed) ? parsed : 0.0;
+	} catch (...) {
+		return 0.0;
+	}
+}
+
 void trace_cuda_ba(const std::string& message)
 {
 	if (!is_cuda_ba_trace_enabled())
@@ -1774,6 +1819,8 @@ public:
 		double nu = 2;
 		double lambda = 0;
 		double F = 0;
+		const double gain_threshold = cuda_ba_gain_threshold();
+		double previous_chi2 = -1;
 
 		// Levenberg-Marquardt iteration
 		for (int iteration = 0; iteration < niterations; iteration++)
@@ -1853,6 +1900,22 @@ public:
 
 			if (q == maxq || rho <= 0 || !std::isfinite(lambda))
 				break;
+
+			// Stop once the solve has converged, before lambda escalation can push
+			// the damped system out of the range where the data Hessian survives.
+			if (gain_threshold > 0 && previous_chi2 > 0 && std::isfinite(F) && F > 0)
+			{
+				const double gain = (previous_chi2 - F) / F;
+				if (gain >= 0 && gain < gain_threshold)
+				{
+					trace_cuda_ba("optimize converged: iteration=" + std::to_string(iteration) +
+						", chi2=" + std::to_string(F) +
+						", gain=" + std::to_string(gain) +
+						", threshold=" + std::to_string(gain_threshold));
+					break;
+				}
+			}
+			previous_chi2 = F;
 		}
 
 		solver_.finalize();
