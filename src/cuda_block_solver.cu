@@ -717,14 +717,37 @@ __device__ void computeJacobiansExact<3>(const Vec3d& Xc, const Vec3d& Xc_body, 
 	}
 }
 
+// Whether the landmark block inverse is evaluated in double. Default on; see
+// `setSym3x3InvUseDouble` for the measurement behind that choice. Reading a
+// `__constant__` is a broadcast and the branch is warp-uniform, so the switch
+// itself costs nothing measurable.
+__constant__ int c_sym3x3InvUseDouble = 1;
+
 __device__ inline void Sym3x3Inv(ConstMatView3x3d A, MatView3x3d B)
 {
 	// 実装は sym3x3_inv.cuh 側。float32 での det overflow を避けるため
 	// 最大要素で正規化してから逆行列を作る (詳細はそちらのコメント)。
 	Scalar B00, B01, B02, B11, B12, B22;
-	sym3x3InvComponents<Scalar>(
-		A(0, 0), A(0, 1), A(2, 0), A(1, 1), A(1, 2), A(2, 2),
-		&B00, &B01, &B02, &B11, &B12, &B22);
+	if (c_sym3x3InvUseDouble && sizeof(Scalar) < sizeof(double))
+	{
+		// `Scalar` (float) は有効 7 桁しかなく、正規化しても行列式が小さい
+		// 退化した landmark block では精度が落ちる。中間だけ double で持つ。
+		double b00, b01, b02, b11, b12, b22;
+		sym3x3InvComponents<double>(
+			static_cast<double>(A(0, 0)), static_cast<double>(A(0, 1)),
+			static_cast<double>(A(2, 0)), static_cast<double>(A(1, 1)),
+			static_cast<double>(A(1, 2)), static_cast<double>(A(2, 2)),
+			&b00, &b01, &b02, &b11, &b12, &b22);
+		B00 = static_cast<Scalar>(b00); B01 = static_cast<Scalar>(b01);
+		B02 = static_cast<Scalar>(b02); B11 = static_cast<Scalar>(b11);
+		B12 = static_cast<Scalar>(b12); B22 = static_cast<Scalar>(b22);
+	}
+	else
+	{
+		sym3x3InvComponents<Scalar>(
+			A(0, 0), A(0, 1), A(2, 0), A(1, 1), A(1, 2), A(2, 2),
+			&B00, &B01, &B02, &B11, &B12, &B22);
+	}
 
 	B(0, 0) = B00;
 	B(0, 1) = B01;
@@ -3203,6 +3226,27 @@ void solveDiagonalSystem(const GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuPx1Bl
 	const int grid = divUp(size, block);
 	solveDiagonalSystemKernel<<<grid, block>>>(size, Hpp, bp, xp);
 	CUDA_CHECK(cudaGetLastError());
+}
+
+/** @brief Select the precision used for the landmark block inverse.
+ *
+ * Default is double. Measured on BOAR-NEDO-01 083033, 6 full mapping runs each:
+ *
+ *     float   closure median 0.2886 m (range 0.2886-0.3055), solve median 26.5 ms
+ *     double  closure median 0.2608 m (range 0.2247-0.2608), solve median 29.1 ms
+ *
+ * The ranges do not overlap. BA accounts for 6.6% of a mapping run, so the
+ * +12.7% spent inside BA is +0.84% end to end.
+ *
+ * The block is 3x3 and evaluated once per landmark, so the extra FP64 work is
+ * tiny even on parts with a low FP64 ratio. It has not been measured on Jetson.
+ *
+ * @param use_double true to evaluate in double, false to stay in `Scalar`.
+ */
+void setSym3x3InvUseDouble(bool use_double)
+{
+	const int value = use_double ? 1 : 0;
+	CUDA_CHECK(cudaMemcpyToSymbol(c_sym3x3InvUseDouble, &value, sizeof(int)));
 }
 
 } // namespace gpu

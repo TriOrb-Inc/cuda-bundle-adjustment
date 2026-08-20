@@ -28,6 +28,9 @@ namespace gpu
 
 void waitForKernelCompletion();
 
+// Select the precision used for the landmark block inverse (default: double).
+void setSym3x3InvUseDouble(bool use_double);
+
 void buildHplStructure(GpuVec3i& blockpos, GpuHplBlockMat& Hpl, GpuVec1i& indexPL, GpuVec1i& nnzPerCol);
 
 void findHschureMulBlockIndices(const GpuHplBlockMat& Hpl, const GpuHscBlockMat& Hsc,
