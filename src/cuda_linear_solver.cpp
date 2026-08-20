@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <cctype>
 #include <cstdlib>
+#include <cmath>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -201,6 +202,44 @@ bool check_cusolver_status(const cusolverStatus_t status, const char* const cont
 		<< " status=" << static_cast<int>(status)
 		<< std::endl;
 	return false;
+}
+
+// Reject a solution vector that came back non-finite.
+//
+// A direct factorization returns a value even when the system is numerically
+// hopeless, and the status codes do not always catch it: cusolver reports
+// success while the triangular solves divide by an effectively-zero pivot, and
+// the caller has no way to tell a bad step from a small one. Downstream the
+// only thing standing between such a vector and the map is the error
+// accumulator, so check it here where the failure actually happens.
+//
+// The vector is the reduced camera system, 6 * poses entries (18-30 for the
+// local BA windows measured on real data), so the copy is negligible.
+bool solution_is_finite(const Scalar* const d_x, const int size, const char* const context)
+{
+	if (size <= 0)
+		return true;
+
+	std::vector<Scalar> host(static_cast<size_t>(size));
+	const cudaError_t status = cudaMemcpy(
+		host.data(), d_x, sizeof(Scalar) * static_cast<size_t>(size), cudaMemcpyDeviceToHost);
+	if (status != cudaSuccess)
+	{
+		std::cerr << "CUDA BA solution check failed to copy: context=" << context
+		          << " status=" << static_cast<int>(status) << std::endl;
+		return false;
+	}
+
+	for (int i = 0; i < size; ++i)
+	{
+		if (!std::isfinite(static_cast<double>(host[i])))
+		{
+			std::cerr << "CUDA BA linear solver returned a non-finite solution: context=" << context
+			          << " index=" << i << " size=" << size << std::endl;
+			return false;
+		}
+	}
+	return true;
 }
 
 int cusolver_potrf_buffer_size(
@@ -471,31 +510,45 @@ public:
 
 	bool analyze(const SparseSquareMatrixCSR<T>& A)
 	{
-		cusolverSpXcsrcholAnalysis(handle_, A.size(), A.nnz(), A.desc(), A.rowPtr(), A.colInd(), info_);
+		const cusolverStatus_t status = cusolverSpXcsrcholAnalysis(
+			handle_, A.size(), A.nnz(), A.desc(), A.rowPtr(), A.colInd(), info_);
+		if (!check_cusolver_status(status, "csrcholAnalysis"))
+			return false;
 		allocateBuffer(A);
 		return true;
 	}
 
 	bool factorize(SparseSquareMatrixCSR<T>& A)
 	{
+		cusolverStatus_t status = CUSOLVER_STATUS_SUCCESS;
+
 		if constexpr (is_value_type_32f<T>())
-			cusolverSpScsrcholFactor(handle_, A.size(), A.nnz(), A.desc(),
+			status = cusolverSpScsrcholFactor(handle_, A.size(), A.nnz(), A.desc(),
 				A.val(), A.rowPtr(), A.colInd(), info_, buffer_.data());
 
 		if constexpr (is_value_type_64f<T>())
-			cusolverSpDcsrcholFactor(handle_, A.size(), A.nnz(), A.desc(),
+			status = cusolverSpDcsrcholFactor(handle_, A.size(), A.nnz(), A.desc(),
 				A.val(), A.rowPtr(), A.colInd(), info_, buffer_.data());
+
+		// The zero-pivot query alone is not a health check: cusolver can fail
+		// outright and still leave `info_` in a state that reports no zero pivot.
+		if (!check_cusolver_status(status, "csrcholFactor"))
+			return false;
 
 		return !hasZeroPivot();
 	}
 
-	void solve(int size, const T* b, T* x)
+	bool solve(int size, const T* b, T* x)
 	{
+		cusolverStatus_t status = CUSOLVER_STATUS_SUCCESS;
+
 		if constexpr (is_value_type_32f<T>())
-			cusolverSpScsrcholSolve(handle_, size, b, x, info_, buffer_.data());
+			status = cusolverSpScsrcholSolve(handle_, size, b, x, info_, buffer_.data());
 
 		if constexpr (is_value_type_64f<T>())
-			cusolverSpDcsrcholSolve(handle_, size, b, x, info_, buffer_.data());
+			status = cusolverSpDcsrcholSolve(handle_, size, b, x, info_, buffer_.data());
+
+		return check_cusolver_status(status, "csrcholSolve");
 	}
 
 	void destroy()
@@ -605,16 +658,17 @@ public:
 		trace_cuda_ba("linear factorize end");
 	}
 
-	void solve(const T* d_b, T* d_x)
+	bool solve(const T* d_b, T* d_x)
 	{
 		trace_cuda_ba("linear solve begin");
+		bool ok = true;
 		if (doOrdering)
 		{
 			// y = P * b
 			permute(Acsr.size(), d_b, d_y, d_P);
 
 			// solve A * z = y
-			cholesky.solve(Acsr.size(), d_y, d_z);
+			ok = cholesky.solve(Acsr.size(), d_y, d_z);
 
 			// x = PT * z
 			permute(Acsr.size(), d_z, d_x, d_PT);
@@ -622,9 +676,10 @@ public:
 		else
 		{
 			// solve A * x = b
-			cholesky.solve(Acsr.size(), d_b, d_x);
+			ok = cholesky.solve(Acsr.size(), d_b, d_x);
 		}
 		trace_cuda_ba("linear solve end");
+		return ok;
 	}
 
 	void permute(int size, const T* src, T* dst, const int* P)
@@ -755,6 +810,7 @@ public:
 		}
 
 		// analyze
+		size_ = Hsc.rows();
 		cholesky_.analyze(nnz, Hsc.rowPtr(), Hsc.colInd());
 		trace_cuda_ba("linear initialize end");
 	}
@@ -771,7 +827,12 @@ public:
 			return false;
 		}
 
-		cholesky_.solve(d_b, d_x);
+		if (!cholesky_.solve(d_b, d_x))
+			return false;
+
+		if (!solution_is_finite(d_x, size_, "sparse"))
+			return false;
+
 		trace_cuda_ba("sparse linear solver solve end");
 
 		return true;
@@ -781,6 +842,8 @@ private:
 
 	std::vector<int> P_;
 	Cholesky cholesky_;
+	// 解ベクトルの検査に使う。initialize で Hsc の行数を控える。
+	int size_ = 0;
 };
 
 class DenseLinearSolverImpl : public SparseLinearSolver
@@ -902,6 +965,9 @@ public:
 			std::cerr << "CUDA BA dense potrs failed: dev_info=" << dev_info << std::endl;
 			return false;
 		}
+
+		if (!solution_is_finite(this->d_rhs_.data(), this->size_, "dense"))
+			return false;
 
 		CUDA_CHECK(cudaMemcpy(
 			d_x,
