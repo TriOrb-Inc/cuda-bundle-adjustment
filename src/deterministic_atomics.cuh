@@ -106,6 +106,14 @@ constexpr double FIXED_POINT_MAX_ABS = 9.22337e18 / FIXED_POINT_SCALE;
 __device__ __forceinline__ long long
 toFixedPoint(Scalar value)
 {
+	// NaN is not ordered, so neither range guard below catches it and the cvt
+	// instruction maps it to INT64_MIN on NVIDIA hardware (measured on sm_120).
+	// Accumulating INT64_MIN into the unsigned atomic wraps modulo 2^64, so a
+	// diverged iteration produces an arbitrary *small finite* total instead of a
+	// non-finite one. Saturate positive like +Inf: an error accumulator must
+	// report "infinitely bad", never something the caller can mistake for
+	// convergence.
+	if (isnan(value)) return (long long)((1ULL << 63) - 1ULL);
 	// Clamp to the representable range to avoid UB from the cvt instruction.
 	if (value >= FIXED_POINT_MAX_ABS) return (long long)((1ULL << 63) - 1ULL);
 	if (value <= -FIXED_POINT_MAX_ABS) return (long long)(1ULL << 63);
