@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 #include "cuda_block_solver.h"
+#include "sym3x3_inv.cuh"
 
 #include <algorithm>
 #include <cuda_runtime.h>
@@ -718,29 +719,12 @@ __device__ void computeJacobiansExact<3>(const Vec3d& Xc, const Vec3d& Xc_body, 
 
 __device__ inline void Sym3x3Inv(ConstMatView3x3d A, MatView3x3d B)
 {
-	const Scalar A00 = A(0, 0);
-	const Scalar A01 = A(0, 1);
-	const Scalar A11 = A(1, 1);
-	const Scalar A02 = A(2, 0);
-	const Scalar A12 = A(1, 2);
-	const Scalar A22 = A(2, 2);
-
-	const Scalar det
-		= A00 * A11 * A22
-		+ A01 * A12 * A02
-		+ A02 * A01 * A12
-		- A00 * A12 * A12
-		- A02 * A11 * A02
-		- A01 * A01 * A22;
-
-	const Scalar invDet = 1 / det;
-
-	const Scalar B00 = invDet * (A11 * A22 - A12 * A12);
-	const Scalar B01 = invDet * (A02 * A12 - A01 * A22);
-	const Scalar B11 = invDet * (A00 * A22 - A02 * A02);
-	const Scalar B02 = invDet * (A01 * A12 - A02 * A11);
-	const Scalar B12 = invDet * (A02 * A01 - A00 * A12);
-	const Scalar B22 = invDet * (A00 * A11 - A01 * A01);
+	// 実装は sym3x3_inv.cuh 側。float32 での det overflow を避けるため
+	// 最大要素で正規化してから逆行列を作る (詳細はそちらのコメント)。
+	Scalar B00, B01, B02, B11, B12, B22;
+	sym3x3InvComponents<Scalar>(
+		A(0, 0), A(0, 1), A(2, 0), A(1, 1), A(1, 2), A(2, 2),
+		&B00, &B01, &B02, &B11, &B12, &B22);
 
 	B(0, 0) = B00;
 	B(0, 1) = B01;
