@@ -78,6 +78,42 @@ bool is_cuda_ba_trace_enabled()
 //
 // Formula matches g2o's SparseOptimizerTerminateAction, which stella_vslam
 // runs at 1e-3.
+// Largest lambda that still survives the narrowing to `Scalar`.
+//
+// lambda is a double inside the LM loop, but `ScalarCast(lambda)` narrows it
+// before it reaches the Hessian diagonal, and the shipping build has
+// `Scalar = float`. Past FLT_MAX (3.4e38) the cast yields Inf, the damped
+// diagonal becomes Inf, and every block inverse comes back NaN -- measured:
+//
+//   lambda=1e+38    float=1e+38   diag=1e+38   normalised a_ii=1     ok
+//   lambda=3.5e+38  float=inf     diag=inf     normalised a_ii=nan   broken
+//
+// The loop's own give-up test is `!std::isfinite(lambda)`, which operates on
+// the double and so only trips near 1.8e308 -- far too late. Escalation is
+// fast enough to cross the gap: one iteration multiplies lambda by up to
+// 2^(1+2+...+10) = 2^55 ~ 3.6e16 when every attempt is rejected.
+//
+// Unlike the gain threshold this is a genuine no-op in normal operation. The
+// largest lambda observed on real data is 4.6e11, twenty-seven orders of
+// magnitude below the limit; the guard only engages in the runaway case it
+// exists for.
+//
+// The env override exists so the guard can be exercised without rebuilding.
+double cuda_ba_max_lambda()
+{
+	const double representable =
+		static_cast<double>(std::numeric_limits<Scalar>::max()) / 2;
+	const char* env_value = std::getenv("TRIORB_CUDA_BA_MAX_LAMBDA");
+	if (env_value == nullptr)
+		return representable;
+	try {
+		const double parsed = std::stod(env_value);
+		return (std::isfinite(parsed) && parsed > 0) ? parsed : representable;
+	} catch (...) {
+		return representable;
+	}
+}
+
 double cuda_ba_gain_threshold()
 {
 	const char* env_value = std::getenv("TRIORB_CUDA_BA_GAIN_THRESHOLD");
@@ -1820,6 +1856,7 @@ public:
 		double lambda = 0;
 		double F = 0;
 		const double gain_threshold = cuda_ba_gain_threshold();
+		const double max_lambda = cuda_ba_max_lambda();
 		double previous_chi2 = -1;
 
 		// Levenberg-Marquardt iteration
@@ -1851,6 +1888,17 @@ public:
 			double rho = -1;
 			for (; q < maxq && rho < 0; q++)
 			{
+				// Stop before lambda stops being representable in `Scalar`; past that
+				// the damped diagonal is Inf and every block inverse returns NaN.
+				// rho is still negative here, so the outer test ends the solve.
+				if (!(lambda <= max_lambda))
+				{
+					trace_cuda_ba("optimize lambda limit reached: iteration=" +
+						std::to_string(iteration) + ", attempt=" + std::to_string(q) +
+						", lambda=" + std::to_string(lambda) +
+						", limit=" + std::to_string(max_lambda));
+					break;
+				}
 				trace_cuda_ba("optimize LM attempt begin: iteration=" + std::to_string(iteration) +
 					", attempt=" + std::to_string(q) +
 					", lambda=" + std::to_string(lambda));
