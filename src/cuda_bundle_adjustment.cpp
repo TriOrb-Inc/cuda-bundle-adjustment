@@ -126,6 +126,13 @@ double cuda_ba_max_lambda()
 //
 // The ranges do not overlap. BA is 6.6% of a mapping run, so the +12.7% inside
 // BA is +0.84% end to end. One dataset; not measured on Jetson.
+// Enable the landmark-block conditioning counters (diagnostic only).
+bool cuda_ba_sym3x3_stats_enabled()
+{
+	const char* env_value = std::getenv("TRIORB_CUDA_BA_SYM3X3_STATS");
+	return env_value != nullptr && std::string(env_value) == "1";
+}
+
 bool cuda_ba_sym3x3_inv_use_double()
 {
 	const char* env_value = std::getenv("TRIORB_CUDA_BA_SYM3X3_DOUBLE");
@@ -1866,6 +1873,7 @@ public:
 	{
 		// Device-side switch, so it has to be pushed before any kernel runs.
 		gpu::setSym3x3InvUseDouble(cuda_ba_sym3x3_inv_use_double());
+		gpu::setSym3x3StatsEnabled(cuda_ba_sym3x3_stats_enabled());
 		solver_.initialize(vertexMapP_, vertexMapL_, vertexMapE_, edges2D_, edges3D_, relativePoseEdges_, kernels_);
 
 		stats_.clear();
@@ -1882,6 +1890,9 @@ public:
 		const double gain_threshold = cuda_ba_gain_threshold();
 		const double max_lambda = cuda_ba_max_lambda();
 		double previous_chi2 = -1;
+		const bool sym3x3_stats = cuda_ba_sym3x3_stats_enabled();
+		if (sym3x3_stats)
+			gpu::resetSym3x3Stats();
 
 		// Levenberg-Marquardt iteration
 		for (int iteration = 0; iteration < niterations; iteration++)
@@ -1990,6 +2001,19 @@ public:
 			previous_chi2 = F;
 		}
 
+		if (sym3x3_stats)
+		{
+			unsigned long long total = 0, b3 = 0, b5 = 0, b7 = 0;
+			gpu::readSym3x3Stats(&total, &b3, &b5, &b7);
+			// 正規化後の |det| がどこまで小さい landmark block を含むか。
+			// float は有効 7 桁なので、1e-7 未満は逆行列の精度が残らない領域。
+			// このライブラリは spdlog を持たないので stderr へ直接出す
+			// (trace と同じ経路で、呼び出し側の log へ載る)。
+			std::cerr << "[sym3x3_conditioning] blocks=" << total
+			          << " below_1e-3=" << b3
+			          << " below_1e-5=" << b5
+			          << " below_1e-7=" << b7 << std::endl;
+		}
 		solver_.finalize();
 		solver_.getChiSqs(chiSqs_);
 		solver_.getTimeProfile(timeProfile_);

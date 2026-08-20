@@ -31,6 +31,12 @@ void waitForKernelCompletion();
 // Select the precision used for the landmark block inverse (default: double).
 void setSym3x3InvUseDouble(bool use_double);
 
+// Landmark-block conditioning counters (off by default; diagnostic only).
+void setSym3x3StatsEnabled(bool enabled);
+void resetSym3x3Stats();
+void readSym3x3Stats(unsigned long long* total, unsigned long long* below_1em3,
+	unsigned long long* below_1em5, unsigned long long* below_1em7);
+
 void buildHplStructure(GpuVec3i& blockpos, GpuHplBlockMat& Hpl, GpuVec1i& indexPL, GpuVec1i& nnzPerCol);
 
 void findHschureMulBlockIndices(const GpuHplBlockMat& Hpl, const GpuHscBlockMat& Hsc,

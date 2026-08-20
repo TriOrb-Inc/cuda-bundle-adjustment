@@ -723,6 +723,29 @@ __device__ void computeJacobiansExact<3>(const Vec3d& Xc, const Vec3d& Xc_body, 
 // itself costs nothing measurable.
 __constant__ int c_sym3x3InvUseDouble = 1;
 
+// Diagnostics for how ill-conditioned the landmark blocks actually are.
+// Off by default; `TRIORB_CUDA_BA_SYM3X3_STATS=1` turns it on. When off the
+// only cost is one `__constant__` read and a not-taken branch.
+//
+// The quantity counted is the determinant of the *normalised* block. After
+// scaling, the entries sit in [-1, 1], so |det| near zero means the block is
+// close to singular relative to its own magnitude, which is exactly when float
+// (~7 significant digits) runs out of accuracy.
+__constant__ int c_sym3x3StatsEnabled = 0;
+__device__ unsigned long long g_sym3x3Total;
+__device__ unsigned long long g_sym3x3Below1em3;
+__device__ unsigned long long g_sym3x3Below1em5;
+__device__ unsigned long long g_sym3x3Below1em7;
+
+__device__ inline void accumulateSym3x3Stats(double scaled_det)
+{
+	const double magnitude = fabs(scaled_det);
+	atomicAdd(&g_sym3x3Total, 1ULL);
+	if (magnitude < 1e-3) atomicAdd(&g_sym3x3Below1em3, 1ULL);
+	if (magnitude < 1e-5) atomicAdd(&g_sym3x3Below1em5, 1ULL);
+	if (magnitude < 1e-7) atomicAdd(&g_sym3x3Below1em7, 1ULL);
+}
+
 __device__ inline void Sym3x3Inv(ConstMatView3x3d A, MatView3x3d B)
 {
 	// 実装は sym3x3_inv.cuh 側。float32 での det overflow を避けるため
@@ -732,21 +755,26 @@ __device__ inline void Sym3x3Inv(ConstMatView3x3d A, MatView3x3d B)
 	{
 		// `Scalar` (float) は有効 7 桁しかなく、正規化しても行列式が小さい
 		// 退化した landmark block では精度が落ちる。中間だけ double で持つ。
-		double b00, b01, b02, b11, b12, b22;
+		double b00, b01, b02, b11, b12, b22, det = 0.0;
 		sym3x3InvComponents<double>(
 			static_cast<double>(A(0, 0)), static_cast<double>(A(0, 1)),
 			static_cast<double>(A(2, 0)), static_cast<double>(A(1, 1)),
 			static_cast<double>(A(1, 2)), static_cast<double>(A(2, 2)),
-			&b00, &b01, &b02, &b11, &b12, &b22);
+			&b00, &b01, &b02, &b11, &b12, &b22, &det);
+		if (c_sym3x3StatsEnabled)
+			accumulateSym3x3Stats(det);
 		B00 = static_cast<Scalar>(b00); B01 = static_cast<Scalar>(b01);
 		B02 = static_cast<Scalar>(b02); B11 = static_cast<Scalar>(b11);
 		B12 = static_cast<Scalar>(b12); B22 = static_cast<Scalar>(b22);
 	}
 	else
 	{
+		Scalar det = Scalar(0);
 		sym3x3InvComponents<Scalar>(
 			A(0, 0), A(0, 1), A(2, 0), A(1, 1), A(1, 2), A(2, 2),
-			&B00, &B01, &B02, &B11, &B12, &B22);
+			&B00, &B01, &B02, &B11, &B12, &B22, &det);
+		if (c_sym3x3StatsEnabled)
+			accumulateSym3x3Stats(static_cast<double>(det));
 	}
 
 	B(0, 0) = B00;
@@ -3243,6 +3271,36 @@ void solveDiagonalSystem(const GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuPx1Bl
  *
  * @param use_double true to evaluate in double, false to stay in `Scalar`.
  */
+/** @brief Enable or disable the landmark-block conditioning counters. */
+void setSym3x3StatsEnabled(bool enabled)
+{
+	const int value = enabled ? 1 : 0;
+	CUDA_CHECK(cudaMemcpyToSymbol(c_sym3x3StatsEnabled, &value, sizeof(int)));
+}
+
+/** @brief Zero the conditioning counters. Call before a solve. */
+void resetSym3x3Stats()
+{
+	const unsigned long long zero = 0ULL;
+	CUDA_CHECK(cudaMemcpyToSymbol(g_sym3x3Total, &zero, sizeof(zero)));
+	CUDA_CHECK(cudaMemcpyToSymbol(g_sym3x3Below1em3, &zero, sizeof(zero)));
+	CUDA_CHECK(cudaMemcpyToSymbol(g_sym3x3Below1em5, &zero, sizeof(zero)));
+	CUDA_CHECK(cudaMemcpyToSymbol(g_sym3x3Below1em7, &zero, sizeof(zero)));
+}
+
+/** @brief Read back the conditioning counters accumulated since the last reset. */
+void readSym3x3Stats(
+	unsigned long long* total,
+	unsigned long long* below_1em3,
+	unsigned long long* below_1em5,
+	unsigned long long* below_1em7)
+{
+	CUDA_CHECK(cudaMemcpyFromSymbol(total, g_sym3x3Total, sizeof(*total)));
+	CUDA_CHECK(cudaMemcpyFromSymbol(below_1em3, g_sym3x3Below1em3, sizeof(*below_1em3)));
+	CUDA_CHECK(cudaMemcpyFromSymbol(below_1em5, g_sym3x3Below1em5, sizeof(*below_1em5)));
+	CUDA_CHECK(cudaMemcpyFromSymbol(below_1em7, g_sym3x3Below1em7, sizeof(*below_1em7)));
+}
+
 void setSym3x3InvUseDouble(bool use_double)
 {
 	const int value = use_double ? 1 : 0;

@@ -47,10 +47,17 @@ namespace gpu
 //
 // Factoring out the largest entry keeps every intermediate near unity:
 // det(A/s) = det(A)/s^3 and inv(A/s) = s*inv(A), so inv(A) = inv(A/s)/s.
+//
+// `scaled_det_out` is optional. It receives the determinant of the *normalised*
+// block, which is the quantity that decides how much precision the inverse
+// needs: after scaling the entries sit in [-1, 1], so |det| near zero means the
+// block is close to singular relative to its own magnitude. float carries ~7
+// significant digits, so a scaled |det| below ~1e-7 has no accuracy left.
 template <typename S>
 __host__ __device__ inline void sym3x3InvComponents(
 	S A00_raw, S A01_raw, S A02_raw, S A11_raw, S A12_raw, S A22_raw,
-	S* B00, S* B01, S* B02, S* B11, S* B12, S* B22)
+	S* B00, S* B01, S* B02, S* B11, S* B12, S* B22,
+	S* scaled_det_out)
 {
 	S scale = fabs(A00_raw);
 	scale = fmax(scale, fabs(A01_raw));
@@ -88,6 +95,20 @@ __host__ __device__ inline void sym3x3InvComponents(
 	*B02 = invDet * (A01 * A12 - A02 * A11);
 	*B12 = invDet * (A02 * A01 - A00 * A12);
 	*B22 = invDet * (A00 * A11 - A01 * A01);
+
+	if (scaled_det_out != nullptr)
+		*scaled_det_out = det;
+}
+
+// Overload without the diagnostic output, so existing call sites stay unchanged.
+template <typename S>
+__host__ __device__ inline void sym3x3InvComponents(
+	S A00_raw, S A01_raw, S A02_raw, S A11_raw, S A12_raw, S A22_raw,
+	S* B00, S* B01, S* B02, S* B11, S* B12, S* B22)
+{
+	S ignored = S(0);
+	sym3x3InvComponents<S>(A00_raw, A01_raw, A02_raw, A11_raw, A12_raw, A22_raw,
+	                       B00, B01, B02, B11, B12, B22, &ignored);
 }
 
 } // namespace gpu
