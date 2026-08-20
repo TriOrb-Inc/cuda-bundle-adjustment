@@ -45,6 +45,7 @@ http ://www.apache.org/licenses/LICENSE-2.0
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <limits>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -82,6 +83,54 @@ __global__ void accumulateKernel(int n, const double* values, long long* slot)
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
   cuba::gpu::deterministic::atomicAccumDet(slot, values[i]);
+}
+
+// A diverged LM step makes every residual in a block non-finite. NaN is not
+// ordered, so it slips past both range guards in toFixedPoint and the cvt
+// instruction maps it to INT64_MIN (measured on sm_120). Accumulating INT64_MIN
+// into the unsigned atomic wraps modulo 2^64, so the total comes back as an
+// arbitrary *small finite* number. The caller then compares
+// `rho = (F - Fhat) / scale`, sees a huge improvement, and accepts the diverged
+// step -- which is how NaN landmark positions reached a saved map.
+//
+// toFixedPoint must therefore saturate NaN positive, like +Inf: an error
+// accumulator may report "infinitely bad", never something mistakable for
+// convergence.
+bool testNonFiniteSaturatesPositive()
+{
+  const std::vector<double> samples = {
+    std::numeric_limits<double>::quiet_NaN(),
+    -std::numeric_limits<double>::quiet_NaN(),
+    std::numeric_limits<double>::infinity(),
+  };
+  const int n = static_cast<int>(samples.size());
+
+  double* d_src = nullptr;
+  double* d_dst = nullptr;
+  CHECK_CUDA(cudaMalloc(&d_src, n * sizeof(double)));
+  CHECK_CUDA(cudaMalloc(&d_dst, n * sizeof(double)));
+  CHECK_CUDA(cudaMemcpy(d_src, samples.data(), n * sizeof(double), cudaMemcpyHostToDevice));
+  roundtripKernel<<<1, n>>>(n, d_src, d_dst);
+  CHECK_CUDA(cudaDeviceSynchronize());
+  std::vector<double> host(n, 0.0);
+  CHECK_CUDA(cudaMemcpy(host.data(), d_dst, n * sizeof(double), cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaFree(d_src));
+  CHECK_CUDA(cudaFree(d_dst));
+
+  const double expected = cuba::gpu::deterministic::FIXED_POINT_MAX_ABS;
+  bool ok = true;
+  const char* names[] = {"NaN", "-NaN", "+Inf"};
+  for (int i = 0; i < n; ++i) {
+    // Saturation is exact up to the fixed-point quantum, so compare relatively.
+    const bool saturated = host[i] > expected * 0.99;
+    if (!saturated) {
+      std::printf("  FAIL %-5s -> %g (expected saturation near %g)\n", names[i], host[i], expected);
+      ok = false;
+    } else {
+      std::printf("  ok   %-5s -> %g\n", names[i], host[i]);
+    }
+  }
+  return ok;
 }
 
 bool testRoundTripPrecision()
@@ -221,14 +270,20 @@ int main()
   int failures = 0;
 
   // 1. Round-trip precision on representative magnitudes.
-  std::printf("\n[1/2] round-trip precision\n");
+  std::printf("\n[1/3] round-trip precision\n");
   if (!testRoundTripPrecision()) {
+    ++failures;
+  }
+
+  // 2. Non-finite inputs must saturate positive, never wrap to a small total.
+  std::printf("\n[2/3] non-finite saturation\n");
+  if (!testNonFiniteSaturatesPositive()) {
     ++failures;
   }
 
   // 2. Determinism + accuracy on parallel accumulation over representative
   //    edge counts and magnitudes.
-  std::printf("\n[2/2] parallel accumulation determinism & accuracy\n");
+  std::printf("\n[3/3] parallel accumulation determinism & accuracy\n");
   const int edge_counts[] = {100, 1000, 10000, 100000};
   const double magnitudes[] = {1e-2, 1.0, 1e2};
   for (int ec : edge_counts) {

@@ -54,6 +54,13 @@ using Lx1BlockPtr = BlockPtr<Scalar, LDIM, 1>;
 // Constants
 ////////////////////////////////////////////////////////////////////////////////////
 constexpr int BLOCK_ACTIVE_ERRORS = 512;
+
+// Error value reported for a block whose residuals came out non-finite.
+// Large enough that LM can never mistake it for progress, small enough that
+// summing it over every block of `computeActiveErrorsKernel` (grid is fixed at
+// 16) stays far inside `deterministic::FIXED_POINT_MAX_ABS` (~8.59e9) and cannot
+// wrap the unsigned atomic.
+constexpr Scalar NON_FINITE_CHI_SENTINEL = static_cast<Scalar>(1e8);
 constexpr int BLOCK_MAX_DIAGONAL = 512;
 constexpr int BLOCK_COMPUTE_SCALE = 512;
 
@@ -1110,10 +1117,23 @@ __global__ void computeActiveErrorsKernel(int nedges, const Vec4d* qs, const Vec
 
 	if (sharedIdx == 0)
 	{
+		Scalar blockChi = cache[0];
+		// A diverged LM step turns landmark positions into NaN, which makes every
+		// residual in this block non-finite. Handing that straight to the
+		// accumulator is what let a diverged solve masquerade as a converged one:
+		// the caller compares `rho = (F - Fhat) / scale` and accepts any step that
+		// lowers the error, so a wrapped-around or dropped total reads as a huge
+		// improvement. Report a large finite error instead, so LM rejects the step,
+		// raises lambda and retries -- which is exactly the safeguard LM is for.
+		//
+		// The grid is fixed at 16 blocks for this kernel, so 16 * sentinel stays
+		// well inside the fixed-point range and cannot wrap.
+		if (!isfinite(blockChi))
+			blockChi = NON_FINITE_CHI_SENTINEL;
 		if (chi_int != nullptr)
-			deterministic::atomicAccumDet(chi_int, cache[0]);
+			deterministic::atomicAccumDet(chi_int, blockChi);
 		else
-			atomicAdd(chi, cache[0]);
+			atomicAdd(chi, blockChi);
 	}
 }
 
