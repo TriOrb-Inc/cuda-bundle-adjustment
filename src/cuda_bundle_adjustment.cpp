@@ -114,6 +114,28 @@ double cuda_ba_max_lambda()
 	}
 }
 
+// Whether the landmark block inverse is evaluated in double. Default on.
+//
+// `Scalar` is float in the shipping build, which leaves 7 significant digits.
+// Scaling stopped the overflow, but a landmark whose 3x3 block is nearly
+// singular (poor triangulation geometry, small lambda) still loses accuracy
+// there. Measured on BOAR-NEDO-01 083033, 6 full mapping runs each:
+//
+//   float   closure median 0.2886 m (range 0.2886-0.3055), solve median 26.5 ms
+//   double  closure median 0.2608 m (range 0.2247-0.2608), solve median 29.1 ms
+//
+// The ranges do not overlap. BA is 6.6% of a mapping run, so the +12.7% inside
+// BA is +0.84% end to end. One dataset; not measured on Jetson.
+bool cuda_ba_sym3x3_inv_use_double()
+{
+	const char* env_value = std::getenv("TRIORB_CUDA_BA_SYM3X3_DOUBLE");
+	if (env_value == nullptr)
+		return true;
+	const std::string value(env_value);
+	return !(value == "0" || value == "false" || value == "FALSE" ||
+		value == "off" || value == "OFF" || value == "no" || value == "NO");
+}
+
 double cuda_ba_gain_threshold()
 {
 	const char* env_value = std::getenv("TRIORB_CUDA_BA_GAIN_THRESHOLD");
@@ -1842,6 +1864,8 @@ public:
 
 	void initialize() override
 	{
+		// Device-side switch, so it has to be pushed before any kernel runs.
+		gpu::setSym3x3InvUseDouble(cuda_ba_sym3x3_inv_use_double());
 		solver_.initialize(vertexMapP_, vertexMapL_, vertexMapE_, edges2D_, edges3D_, relativePoseEdges_, kernels_);
 
 		stats_.clear();
