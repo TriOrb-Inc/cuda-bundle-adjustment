@@ -21,6 +21,20 @@
 - relative pose prior は pose vertex の `pose-from-world` 状態 `V_from` / `V_to` から、Rust ABI と同じ world-from relative `Z = V_from * inverse(V_to)` を予測します。回転は `q_from * conjugate(q_to)`、並進は `t_from - R_pred * t_to` で評価します。
 - relative edgeは成分maskをerror、chi2、数値Jacobian、Hessian/gradientへ同じ順序で適用します。x/y/yaw maskでは平面yaw差とtx/tyだけを使い、relative専用Cauchyのcostと微分を同じmasked errorから計算します。
 
+### findHschureMulBlockIndicesKernel は重複 Hpl slot の転置 pair も発行する
+
+landmark column 内の pair 列挙は上三角 (`j >= i`) だが、同一 `(pose, landmark)` を指す
+Hpl slot が複数あるとき、その pair は Hschur の**対角** block へ解決される。
+対角 block は `convertBSRToCSR` が 36 要素そのまま写すだけで対称化しないため、
+上三角だけでは転置項 `Hpl_invHll[j] * Hpl[i]^T` が落ちて対角 block が減算不足かつ非対称になる。
+`i != j && iP1 == iP2` のときだけ転置 pair を追加発行して `m^2` 個に戻す。
+非対角は `convertBSRToCSR` が `(r,c)` `(c,r)` 両方へ書くので不要。
+
+重複 slot は multi-camera rig で常態である (実測: 健全 cell で BA 呼び出しの 99%、
+全 slot の 10-14%、最大多重度 4)。容量は `hplPairEnumerationUpperBound()` が
+`Σ m(m-1)/2` を見込む。詳細は
+`slam-core/reports/experiments/cuda-ba-hschur-duplicate-slots-20260822.md`。
+
 ## 実装上の判断
 
 - この repo では `prepareCudaThreadContext()` を追加し、Thrust 呼び出しや主要な host 側 CUDA entry point の直前で `cudaSetDevice(0)` を再実行します。

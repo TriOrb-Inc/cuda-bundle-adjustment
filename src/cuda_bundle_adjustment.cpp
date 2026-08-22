@@ -18,6 +18,8 @@ limitations under the License.
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <vector>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -648,6 +650,7 @@ public:
 		nedges2D_ = nedges2D;
 		nedges3D_ = nedges3D;
 		nHplBlocks_ = static_cast<int>(HplBlockPos_.size());
+
 		trace_cuda_ba(
 			"solver initialize host graph prepared: active_poses=" + std::to_string(numP_) +
 			", active_landmarks=" + std::to_string(numL_) +
@@ -1461,6 +1464,33 @@ private:
 		{
 			const size_t n = static_cast<size_t>(count);
 			capacity += n * (n + 1U) / 2U;
+			if (capacity > static_cast<size_t>(std::numeric_limits<int>::max()))
+			{
+				throw std::runtime_error("Hpl pair enumeration exceeds int capacity");
+			}
+		}
+
+		// 同一 (row, col) を指す Hpl slot が複数あると、その pair は Hschur の
+		// 対角 block へ解決される。対角 block は convertBSRToCSR が対称化しないので、
+		// findHschureMulBlockIndicesKernel は上三角ぶんに加えて転置 pair も発行する。
+		// 多重度 m の組ごとに m(m-1)/2 件増えるぶんをここで見込む。見込み忘れると
+		// kernel の overflow flag が立つ。
+		std::unordered_map<long long, int> slotMultiplicity;
+		slotMultiplicity.reserve(HplBlockPos_.size() * 2U);
+		for (const auto& blockPos : HplBlockPos_)
+		{
+			const long long key = (static_cast<long long>(blockPos.row) << 32) |
+				static_cast<long long>(static_cast<unsigned int>(blockPos.col));
+			slotMultiplicity[key]++;
+		}
+		for (const auto& entry : slotMultiplicity)
+		{
+			const size_t m = static_cast<size_t>(entry.second);
+			if (m <= 1U)
+			{
+				continue;
+			}
+			capacity += m * (m - 1U) / 2U;
 			if (capacity > static_cast<size_t>(std::numeric_limits<int>::max()))
 			{
 				throw std::runtime_error("Hpl pair enumeration exceeds int capacity");

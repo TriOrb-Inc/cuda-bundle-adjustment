@@ -1726,6 +1726,34 @@ __global__ void findHschureMulBlockIndicesKernel(int cols, const int* HplColPtr,
 				{
 					atomicExch(overflow, 1);
 				}
+
+				// 同一 (pose, landmark) を指す Hpl slot が複数あると、この pair は
+				// Hschur の対角 block へ解決される。対角 block は convertBSRToCSR が
+				// 36 要素そのまま写すだけで対称化しないので、上三角 (j >= i) だけの
+				// 列挙では転置項 Hpl_invHll[j] * Hpl[i]^T が落ちる。落とすと対角 block が
+				// 減算不足かつ非対称になり、assert も CUDA error も出ないまま Δxp が誤る。
+				//
+				// 多重度 m の組では真値が m * m 個の積を要するのに対し、上三角列挙は
+				// m(m+1)/2 個しか出さない。ここで m(m-1)/2 個の転置を補って m * m に戻す。
+				//
+				// 非対角 (iP1 != iP2) は convertBSRToCSR が (r,c) と (c,r) の両方へ
+				// 書くので補う必要はない。
+				//
+				// 重複 slot は multi-camera rig で常態である。同一 keyframe の複数 camera が
+				// 同一 landmark を観測すると、body pose vertex は keyframe あたり 1 個なので
+				// 同じ (iP, iL) の Hpl block が camera 台数ぶん積まれる。
+				if (i != j && iP1 == iP2)
+				{
+					const int posTransposed = atomicAdd(nindices, 1);
+					if (posTransposed < mulBlockCapacity)
+					{
+						mulBlockIds[posTransposed] = makeVec3i(j, i, k);
+					}
+					else
+					{
+						atomicExch(overflow, 1);
+					}
+				}
 			}
 		}
 	}
