@@ -71,9 +71,11 @@ struct StubEdge : BaseEdge
 {
 	PoseVertex* vP = nullptr;
 	LandmarkVertex* vL = nullptr;
+	cuba::ExtrinsicsVertex* vE = nullptr;
 
 	PoseVertex* poseVertex() const override { return vP; }
 	LandmarkVertex* landmarkVertex() const override { return vL; }
+	cuba::ExtrinsicsVertex* extrinsicsVertex() const override { return vE; }
 	int dim() const override { return 2; }
 };
 
@@ -169,6 +171,52 @@ int main()
 		expectEq("rows with diagonal", countDiagonalRows(Hsc2), Hsc2.brows());
 		Hsc2.convertBSRToCSR();
 		expectEq("rowPtr[rows]", Hsc2.rowPtr()[Hsc2.rows()], Hsc2.nnzSymm());
+	}
+
+	// joint-ext: 固定 landmark としか繋がらない (pose, ext) の組にも cross block が要る。
+	//
+	// landmark loop は固定 landmark を弾くので、この組は cross block を持たないまま残る。
+	// 一方 edge2HscPE_ の解決は cross block の存在を前提とし、見つからなければ黙って -1 を
+	// 通すので、その edge の寄与が静かに落ちる。
+	{
+		PoseVertex b0, b1;
+		b0.iP = 0; b1.iP = 1;
+		cuba::ExtrinsicsVertex ext;
+		ext.fixed = false;
+		ext.iP = 2;                       // ext は body pose の後ろに詰む
+
+		LandmarkVertex n0;                // 非固定: b0-b1 の cross block を作る
+		n0.fixed = false;
+		LandmarkVertex fx;                // 固定: landmark loop から弾かれる
+		fx.fixed = true;
+
+		StubEdge e0, e1, ef;
+		connect(e0, b0, n0);
+		connect(e1, b1, n0);
+		connect(ef, b1, fx);
+		ef.vE = &ext;
+		ext.edges.insert(&ef);
+
+		const std::vector<LandmarkVertex*> verticesL3{&n0, &fx};
+		HschurSparseBlockMatrix Hsc3;
+		Hsc3.resize(3, 3);
+		Hsc3.constructFromVerticesAndRelativeEdges(verticesL3, relativePoseEdges);
+
+		std::printf("[case] joint-ext で固定 landmark 経由の (pose, ext) 組がある局面\n");
+		expectEq("rows with diagonal", countDiagonalRows(Hsc3), Hsc3.brows());
+
+		// (1, 2) の cross block が確保されていること。
+		const int* rowPtr = Hsc3.outerIndices();
+		const int* colInd = Hsc3.innerIndices();
+		int crossFound = 0;
+		for (int i = rowPtr[1]; i < rowPtr[2]; i++)
+		{
+			if (colInd[i] == 2) crossFound++;
+		}
+		expectEq("cross block (body1, ext)", crossFound, 1);
+
+		Hsc3.convertBSRToCSR();
+		expectEq("rowPtr[rows]", Hsc3.rowPtr()[Hsc3.rows()], Hsc3.nnzSymm());
 	}
 
 	if (g_failures != 0)

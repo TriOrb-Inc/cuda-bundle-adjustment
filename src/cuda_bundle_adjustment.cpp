@@ -854,6 +854,7 @@ public:
 				// vertices after active body pose vertices, so body/ext cross terms always
 				// live in the upper-triangular Hsc structure at row=min(iP, iPExt), col=max(...).
 				edge2HscPE_.assign(static_cast<size_t>(nedges_total), -1);
+				int missingHscPECount = 0;
 				if (extJoint_)
 				{
 					const int* hscOuter = Hsc_.outerIndices();
@@ -878,7 +879,25 @@ public:
 								break;
 							}
 						}
+						// 探索失敗を無言で -1 のまま通すと、その edge の Jp^T Omega Je が
+						// HscDirect へ積まれずに消える。Hpp / bp には ext 寄与が入るので
+						// Schur 系が右辺と整合しなくなるが、溢れないので他に検出手段が無い。
+						// sparse_block_matrix.cpp 側で固定 landmark 経由の cross block も
+						// seed しているので、ここが失敗するなら構造側の想定漏れである。
+						if (edge2HscPE_[edge_idx] < 0)
+						{
+							++missingHscPECount;
+						}
 					}
+				}
+				if (missingHscPECount > 0)
+				{
+					trace_cuda_ba(
+						"WARNING joint-ext edge without Hschur cross block: count=" +
+						std::to_string(missingHscPECount) +
+						", numBody=" + std::to_string(numBody_) +
+						", numExt=" + std::to_string(numExt_) +
+						" (contribution silently dropped)");
 				}
 				d_edge2HscPE_.assign(static_cast<size_t>(nedges_total), edge2HscPE_.data());
 				d_edge2HscPE2D_.map(nedges2D_, d_edge2HscPE_.data());
