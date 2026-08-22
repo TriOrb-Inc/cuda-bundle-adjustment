@@ -2080,6 +2080,22 @@ void findHschureMulBlockIndices(const GpuHplBlockMat& Hpl, const GpuHscBlockMat&
 			"findHschureMulBlockIndices overflow: writes=" + std::to_string(hostNindices) +
 			", capacity=" + std::to_string(mulBlockCapacity));
 	}
+	// 発行数は容量と厳密に一致する。kernel は landmark column ごとに
+	// 上三角 n(n+1)/2 件を必ず発行し (Hschur に対応 block が無い場合も sentinel を出す)、
+	// 加えて重複 Hpl slot について m(m-1)/2 件の転置を発行する。
+	// caller の hplPairEnumerationUpperBound() は同じ式で採寸しているので、
+	// 一致しないなら kernel と容量式のどちらかが片方だけ変更されている。
+	//
+	// これは重複 slot の転置発行が消えたことを検出する回帰 guard でもある。
+	// 転置を落とすと Hschur の対角 block が減算不足かつ非対称になるが、
+	// 溢れないので他に検出手段が無い (assert も CUDA error も出ない)。
+	if (hostNindices != mulBlockCapacity)
+	{
+		throw std::runtime_error(
+			"findHschureMulBlockIndices emission count mismatch: writes=" +
+			std::to_string(hostNindices) + ", expected=" + std::to_string(mulBlockCapacity) +
+			" (kernel の pair 列挙と hplPairEnumerationUpperBound() が不整合)");
+	}
 
 	auto ptrSrc = thrust::device_pointer_cast(mulBlockIds.data());
 	// Option 4 Phase 5: use a total (row, col, hplPairSlot) order. The kernel writes
