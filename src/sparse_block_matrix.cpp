@@ -160,6 +160,33 @@ void HschurSparseBlockMatrix::constructFromVerticesAndRelativeEdges(
 		}
 	}
 
+	// 有効な pose row には必ず対角 block を確保する。
+	//
+	// ここまでで対角 block が入るのは「非固定 landmark を共有する pose」と
+	// 「relative pose edge の端点」だけである。固定 landmark としか繋がらない
+	// pose は row が空のまま残り、次の 2 つが同時に壊れる。
+	//
+	//   1. initializeHschurKernel は全 row で無条件に
+	//      `Hsc.at(HscRowPtr[rowId])` へ Hpp を書く。空 row では
+	//      `HscRowPtr[rowId] == HscRowPtr[rowId + 1]` なので、その pose の Hpp が
+	//      隣の row の先頭 block を上書きする (静かな数値破壊)。
+	//   2. nnzSymm() は対角 block 数を brows_ で決め打ちする。空 row があると
+	//      戻り値が真値より小さくなり、convertBSRToCSR() の colInd_ / BSR2CSR_ が
+	//      溢れる (5 camera + 固定 landmark のみの keyframe で実測: brows=3 /
+	//      nblocks=3 / ndiag=2 のとき idx=108 に対し size=108)。
+	//
+	// 対角 block は Hpp をそのまま持つので数値的にも正しく、既に対角がある
+	// 通常ケースでは 1 block も追加されない。
+	for (int rowId = 0; rowId < brows_; rowId++)
+	{
+		uint8_t* ptrMap = map.data() + rowId * bcols_;
+		if (!ptrMap[rowId])
+		{
+			blockpos.push_back({ rowId, rowId });
+			ptrMap[rowId] = 1;
+		}
+	}
+
 	// set nonzero blocks
 	nblocks_ = static_cast<int>(blockpos.size());
 
