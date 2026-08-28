@@ -1983,6 +1983,19 @@ public:
 				trace_cuda_ba(std::string("optimize solver end: iteration=") + std::to_string(iteration) +
 					", attempt=" + std::to_string(q) +
 					", success=" + (success ? "true" : "false"));
+				if (!success)
+				{
+					// The linear solver writes the increment only on success. Do not
+					// evaluate a stale or uninitialized candidate after a failed solve.
+					trace_cuda_ba("optimize candidate evaluation skipped: iteration=" +
+						std::to_string(iteration) + ", attempt=" + std::to_string(q) +
+						", reason=linear_solve_failed");
+					lambda *= nu;
+					nu *= 2;
+					solver_.restoreDiagonal();
+					solver_.pop();
+					continue;
+				}
 
 				solver_.update();
 				trace_cuda_ba("optimize update end: iteration=" + std::to_string(iteration) +
@@ -1992,7 +2005,7 @@ public:
 				double relativePoseFhat = 0;
 				const double Fhat = solver_.computeErrors(&visualFhat, &relativePoseFhat);
 				const double scale = solver_.computeScale(lambda) + 1e-3;
-				rho = success ? (F - Fhat) / scale : -1;
+				rho = (F - Fhat) / scale;
 				trace_cuda_ba("optimize rho evaluated: iteration=" + std::to_string(iteration) +
 					", attempt=" + std::to_string(q) +
 					", Fhat=" + std::to_string(Fhat) +

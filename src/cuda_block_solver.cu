@@ -2913,6 +2913,7 @@ void twistCSR(int size, int nnz, const int* srcRowPtr, const int* srcColInd, con
 	const int grid = divUp(size, block);
 
 	permuteNnzPerRowKernel<<<grid, block>>>(size, srcRowPtr, P, nnzPerRow);
+	CUDA_CHECK(cudaMemset(nnzPerRow + size, 0, sizeof(int)));
 	exclusiveScan(nnzPerRow, dstRowPtr, size + 1);
 	CUDA_CHECK(cudaMemcpy(nnzPerRow, dstRowPtr, sizeof(int) * (size + 1), cudaMemcpyDeviceToDevice));
 	permuteColIndKernel<<<grid, block>>>(size, srcRowPtr, srcColInd, P, dstColInd, dstMap, nnzPerRow);
@@ -3257,6 +3258,9 @@ Scalar computeScale(const GpuVec1d& x, const GpuVec1d& b, Scalar* scale, Scalar 
 void solveDiagonalSystem(const GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuLx1BlockVec& xl)
 {
 	const int size = Hll.size();
+	if (size == 0)
+		return;
+
 	const int block = 1024;
 	const int grid = divUp(size, block);
 	solveDiagonalSystemKernel<<<grid, block>>>(size, Hll, bl, xl);
@@ -3266,6 +3270,9 @@ void solveDiagonalSystem(const GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuLx1Bl
 void solveDiagonalSystem(const GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuPx1BlockVec& xp)
 {
 	const int size = Hpp.size();
+	if (size == 0)
+		return;
+
 	const int block = 512;
 	const int grid = divUp(size, block);
 	solveDiagonalSystemKernel<<<grid, block>>>(size, Hpp, bp, xp);
