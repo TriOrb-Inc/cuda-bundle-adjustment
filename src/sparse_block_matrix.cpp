@@ -160,6 +160,78 @@ void HschurSparseBlockMatrix::constructFromVerticesAndRelativeEdges(
 		}
 	}
 
+	// joint-ext mode で、固定 landmark 経由の (pose, ext) cross block も確保する。
+	//
+	// 上の landmark loop は `vL->fixed` を弾くので、固定 landmark としか繋がらない
+	// (pose, ext) の組は Hschur に cross block を持たない。一方
+	// cuda_bundle_adjustment.cpp の edge2HscPE_ 解決は「pose と ext を同時に持つ edge には
+	// 必ず (min, max) の cross block がある」と前提し、見つからなければ黙って -1 を通す。
+	// その edge の Jp^T Omega Je は HscDirect へ積まれず消える一方、Hpp / bp には
+	// ext 寄与が入るので、Schur 系が右辺と整合しなくなる。
+	//
+	// ext vertex 単位の空 row は cuda_bundle_adjustment.cpp:393-405 の
+	// hasUnfixedLandmarkEdge guard が塞いでいるが、(pose, ext) pair 単位は塞げていない。
+	// ここで固定 landmark 経由の組を seed して穴を埋める。
+	//
+	// nmultiplies_ は増やさない。固定 landmark は Hpl に row を持たないので
+	// Schur multiply は発生しない。既に cross block がある通常ケースでは 1 block も増えない。
+	for (auto vL : verticesL)
+	{
+		if (!vL->fixed)
+			continue;
+
+		for (const auto e : vL->edges)
+		{
+			const auto vP = e->poseVertex();
+			const auto vE = e->extrinsicsVertex();
+			if (vP == nullptr || vE == nullptr)
+				continue;
+			if (vP->fixed || vE->fixed)
+				continue;
+			if (vP->iP < 0 || vE->iP < 0 || vP->iP == vE->iP)
+				continue;
+
+			const int rowId = std::min(vP->iP, vE->iP);
+			const int colId = std::max(vP->iP, vE->iP);
+			if (rowId < 0 || colId >= bcols_)
+				continue;
+
+			uint8_t* ptrMap = map.data() + rowId * bcols_;
+			if (!ptrMap[colId])
+			{
+				blockpos.push_back({ rowId, colId });
+				ptrMap[colId] = 1;
+			}
+		}
+	}
+
+	// 有効な pose row には必ず対角 block を確保する。
+	//
+	// ここまでで対角 block が入るのは「非固定 landmark を共有する pose」と
+	// 「relative pose edge の端点」だけである。固定 landmark としか繋がらない
+	// pose は row が空のまま残り、次の 2 つが同時に壊れる。
+	//
+	//   1. initializeHschurKernel は全 row で無条件に
+	//      `Hsc.at(HscRowPtr[rowId])` へ Hpp を書く。空 row では
+	//      `HscRowPtr[rowId] == HscRowPtr[rowId + 1]` なので、その pose の Hpp が
+	//      隣の row の先頭 block を上書きする (静かな数値破壊)。
+	//   2. nnzSymm() は対角 block 数を brows_ で決め打ちする。空 row があると
+	//      戻り値が真値より小さくなり、convertBSRToCSR() の colInd_ / BSR2CSR_ が
+	//      溢れる (5 camera + 固定 landmark のみの keyframe で実測: brows=3 /
+	//      nblocks=3 / ndiag=2 のとき idx=108 に対し size=108)。
+	//
+	// 対角 block は Hpp をそのまま持つので数値的にも正しく、既に対角がある
+	// 通常ケースでは 1 block も追加されない。
+	for (int rowId = 0; rowId < brows_; rowId++)
+	{
+		uint8_t* ptrMap = map.data() + rowId * bcols_;
+		if (!ptrMap[rowId])
+		{
+			blockpos.push_back({ rowId, rowId });
+			ptrMap[rowId] = 1;
+		}
+	}
+
 	// set nonzero blocks
 	nblocks_ = static_cast<int>(blockpos.size());
 

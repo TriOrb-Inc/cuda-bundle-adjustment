@@ -20,6 +20,22 @@
 - `findHschureMulBlockIndicesKernel()` は、各 landmark column 内の `Hpl` row-slot pair を列挙して `computeHschureKernel()` 用の `mulBlockIds` を作ります。`Hsc` 側は unique Schur row pair へ dedup される一方、`Hpl` は multi-camera / joint-ext edge で同一 row pair の slot が複数残るため、`Hsc_.nmulBlocks()` をそのまま容量に使うと `mulBlockIds` が不足します。
 - relative pose prior は pose vertex の `pose-from-world` 状態 `V_from` / `V_to` から、Rust ABI と同じ world-from relative `Z = V_from * inverse(V_to)` を予測します。回転は `q_from * conjugate(q_to)`、並進は `t_from - R_pred * t_to` で評価します。
 - relative edgeは成分maskをerror、chi2、数値Jacobian、Hessian/gradientへ同じ順序で適用します。x/y/yaw maskでは平面yaw差とtx/tyだけを使い、relative専用Cauchyのcostと微分を同じmasked errorから計算します。
+- `solveDiagonalSystem()` は pose または landmark の対角 block 数が `0` の場合、CUDA kernel を起動せず正常終了します。空の対角系は解く要素が無く、grid size `0` の kernel 起動は `cudaErrorInvalidConfiguration` になるためです。
+- `twistCSR()` は `size + 1` 要素の exclusive scan に先立ち、row 数 kernel が書かない末尾 sentinel `nnzPerRow[size]` を明示的に `0` へ初期化します。
+
+### findHschureMulBlockIndicesKernel は重複 Hpl slot の転置 pair も発行する
+
+landmark column 内の pair 列挙は上三角 (`j >= i`) だが、同一 `(pose, landmark)` を指す
+Hpl slot が複数あるとき、その pair は Hschur の**対角** block へ解決される。
+対角 block は `convertBSRToCSR` が 36 要素そのまま写すだけで対称化しないため、
+上三角だけでは転置項 `Hpl_invHll[j] * Hpl[i]^T` が落ちて対角 block が減算不足かつ非対称になる。
+`i != j && iP1 == iP2` のときだけ転置 pair を追加発行して `m^2` 個に戻す。
+非対角は `convertBSRToCSR` が `(r,c)` `(c,r)` 両方へ書くので不要。
+
+重複 slot は multi-camera rig で常態である (実測: 健全 cell で BA 呼び出しの 99%、
+全 slot の 10-14%、最大多重度 4)。容量は `hplPairEnumerationUpperBound()` が
+`Σ m(m-1)/2` を見込む。詳細は
+`slam-core/reports/experiments/cuda-ba-hschur-duplicate-slots-20260822.md`。
 
 ## 実装上の判断
 
@@ -33,6 +49,8 @@
 - `buildHplStructure()` と `findHschureMulBlockIndices()` の sort comparator は、duplicate slot を含む Schur 構造を `(col,row,edgeId)` / `(row,col,hplPairSlot)` の total order で並べます。`stable_sort` だけに依存すると、atomic prefix や入力 edge 列の同値キー順が solver 内部の slot 配置へ残るため、deterministic accumulation を有効にしても Local BA / Full BA の更新が微小に分岐し得ます。
 - relative pose prior の通常誤差と数値 Jacobian 用の摂動誤差は同じ world-from relative 式を使います。両 endpoint が active の場合も、各 endpoint の摂動に対して同一 residual を差分評価し、cross block を整合した Jacobian から構成します。
 - all-6/no-kernel/weight 1はlegacy演算式を独立分岐で維持し、既存loop/LiDAR relative edgeの順序と数値を変えません。
+- pose / landmark のどちらか一方が空でも BA 全体は成立し得るため、`solveDiagonalSystem()` の各 overload が自身の block 数だけを確認します。非空系の block / grid 計算と kernel 起動順は変更しません。
+- CSR row pointer の終端値を得るため scan の入力は `size + 1` 要素を維持し、末尾だけを CUDA error 検査付きの `cudaMemset` で初期化します。row ごとの非零要素数と並べ替え順は変更しません。
 
 ## 目標
 
@@ -41,6 +59,8 @@
 - per-edge extrinsics を持つ multi-camera BA でも、CPU 側実装と同じ Jacobian 定義で正しい update 方向を保つ。
 - LiDAR 無効化漏れや future の bad input が入っても、Schur multiply index の容量不整合を GPU memory corruption へ発展させず、診断可能な overflow failure として扱う。
 - deterministic accumulation と組み合わせたときに、duplicate Schur slot の列挙順や Thrust の同値キー処理へ依存しない kernel / solver レベルの再現性を保つ。
+- 空の pose / landmark 対角系を含む問題でも不正な CUDA kernel 構成を起動せず、compute-sanitizer で CUDA API error を出さない。
+- ordered sparse solve の CSR 変換で未初期化 device memory を scan せず、compute-sanitizer initcheck で未初期化値の伝播を出さない。
 
 ## 関連
 

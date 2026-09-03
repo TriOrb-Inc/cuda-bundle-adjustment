@@ -18,6 +18,8 @@ limitations under the License.
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <vector>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -648,6 +650,7 @@ public:
 		nedges2D_ = nedges2D;
 		nedges3D_ = nedges3D;
 		nHplBlocks_ = static_cast<int>(HplBlockPos_.size());
+
 		trace_cuda_ba(
 			"solver initialize host graph prepared: active_poses=" + std::to_string(numP_) +
 			", active_landmarks=" + std::to_string(numL_) +
@@ -851,6 +854,7 @@ public:
 				// vertices after active body pose vertices, so body/ext cross terms always
 				// live in the upper-triangular Hsc structure at row=min(iP, iPExt), col=max(...).
 				edge2HscPE_.assign(static_cast<size_t>(nedges_total), -1);
+				int missingHscPECount = 0;
 				if (extJoint_)
 				{
 					const int* hscOuter = Hsc_.outerIndices();
@@ -875,7 +879,25 @@ public:
 								break;
 							}
 						}
+						// 探索失敗を無言で -1 のまま通すと、その edge の Jp^T Omega Je が
+						// HscDirect へ積まれずに消える。Hpp / bp には ext 寄与が入るので
+						// Schur 系が右辺と整合しなくなるが、溢れないので他に検出手段が無い。
+						// sparse_block_matrix.cpp 側で固定 landmark 経由の cross block も
+						// seed しているので、ここが失敗するなら構造側の想定漏れである。
+						if (edge2HscPE_[edge_idx] < 0)
+						{
+							++missingHscPECount;
+						}
 					}
+				}
+				if (missingHscPECount > 0)
+				{
+					trace_cuda_ba(
+						"WARNING joint-ext edge without Hschur cross block: count=" +
+						std::to_string(missingHscPECount) +
+						", numBody=" + std::to_string(numBody_) +
+						", numExt=" + std::to_string(numExt_) +
+						" (contribution silently dropped)");
 				}
 				d_edge2HscPE_.assign(static_cast<size_t>(nedges_total), edge2HscPE_.data());
 				d_edge2HscPE2D_.map(nedges2D_, d_edge2HscPE_.data());
@@ -1466,6 +1488,33 @@ private:
 				throw std::runtime_error("Hpl pair enumeration exceeds int capacity");
 			}
 		}
+
+		// 同一 (row, col) を指す Hpl slot が複数あると、その pair は Hschur の
+		// 対角 block へ解決される。対角 block は convertBSRToCSR が対称化しないので、
+		// findHschureMulBlockIndicesKernel は上三角ぶんに加えて転置 pair も発行する。
+		// 多重度 m の組ごとに m(m-1)/2 件増えるぶんをここで見込む。見込み忘れると
+		// kernel の overflow flag が立つ。
+		std::unordered_map<long long, int> slotMultiplicity;
+		slotMultiplicity.reserve(HplBlockPos_.size() * 2U);
+		for (const auto& blockPos : HplBlockPos_)
+		{
+			const long long key = (static_cast<long long>(blockPos.row) << 32) |
+				static_cast<long long>(static_cast<unsigned int>(blockPos.col));
+			slotMultiplicity[key]++;
+		}
+		for (const auto& entry : slotMultiplicity)
+		{
+			const size_t m = static_cast<size_t>(entry.second);
+			if (m <= 1U)
+			{
+				continue;
+			}
+			capacity += m * (m - 1U) / 2U;
+			if (capacity > static_cast<size_t>(std::numeric_limits<int>::max()))
+			{
+				throw std::runtime_error("Hpl pair enumeration exceeds int capacity");
+			}
+		}
 		return static_cast<int>(capacity);
 	}
 
@@ -1934,6 +1983,19 @@ public:
 				trace_cuda_ba(std::string("optimize solver end: iteration=") + std::to_string(iteration) +
 					", attempt=" + std::to_string(q) +
 					", success=" + (success ? "true" : "false"));
+				if (!success)
+				{
+					// The linear solver writes the increment only on success. Do not
+					// evaluate a stale or uninitialized candidate after a failed solve.
+					trace_cuda_ba("optimize candidate evaluation skipped: iteration=" +
+						std::to_string(iteration) + ", attempt=" + std::to_string(q) +
+						", reason=linear_solve_failed");
+					lambda *= nu;
+					nu *= 2;
+					solver_.restoreDiagonal();
+					solver_.pop();
+					continue;
+				}
 
 				solver_.update();
 				trace_cuda_ba("optimize update end: iteration=" + std::to_string(iteration) +
@@ -1943,7 +2005,7 @@ public:
 				double relativePoseFhat = 0;
 				const double Fhat = solver_.computeErrors(&visualFhat, &relativePoseFhat);
 				const double scale = solver_.computeScale(lambda) + 1e-3;
-				rho = success ? (F - Fhat) / scale : -1;
+				rho = (F - Fhat) / scale;
 				trace_cuda_ba("optimize rho evaluated: iteration=" + std::to_string(iteration) +
 					", attempt=" + std::to_string(q) +
 					", Fhat=" + std::to_string(Fhat) +

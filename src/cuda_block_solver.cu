@@ -1726,6 +1726,34 @@ __global__ void findHschureMulBlockIndicesKernel(int cols, const int* HplColPtr,
 				{
 					atomicExch(overflow, 1);
 				}
+
+				// 同一 (pose, landmark) を指す Hpl slot が複数あると、この pair は
+				// Hschur の対角 block へ解決される。対角 block は convertBSRToCSR が
+				// 36 要素そのまま写すだけで対称化しないので、上三角 (j >= i) だけの
+				// 列挙では転置項 Hpl_invHll[j] * Hpl[i]^T が落ちる。落とすと対角 block が
+				// 減算不足かつ非対称になり、assert も CUDA error も出ないまま Δxp が誤る。
+				//
+				// 多重度 m の組では真値が m * m 個の積を要するのに対し、上三角列挙は
+				// m(m+1)/2 個しか出さない。ここで m(m-1)/2 個の転置を補って m * m に戻す。
+				//
+				// 非対角 (iP1 != iP2) は convertBSRToCSR が (r,c) と (c,r) の両方へ
+				// 書くので補う必要はない。
+				//
+				// 重複 slot は multi-camera rig で常態である。同一 keyframe の複数 camera が
+				// 同一 landmark を観測すると、body pose vertex は keyframe あたり 1 個なので
+				// 同じ (iP, iL) の Hpl block が camera 台数ぶん積まれる。
+				if (i != j && iP1 == iP2)
+				{
+					const int posTransposed = atomicAdd(nindices, 1);
+					if (posTransposed < mulBlockCapacity)
+					{
+						mulBlockIds[posTransposed] = makeVec3i(j, i, k);
+					}
+					else
+					{
+						atomicExch(overflow, 1);
+					}
+				}
 			}
 		}
 	}
@@ -2051,6 +2079,22 @@ void findHschureMulBlockIndices(const GpuHplBlockMat& Hpl, const GpuHscBlockMat&
 		throw std::runtime_error(
 			"findHschureMulBlockIndices overflow: writes=" + std::to_string(hostNindices) +
 			", capacity=" + std::to_string(mulBlockCapacity));
+	}
+	// 発行数は容量と厳密に一致する。kernel は landmark column ごとに
+	// 上三角 n(n+1)/2 件を必ず発行し (Hschur に対応 block が無い場合も sentinel を出す)、
+	// 加えて重複 Hpl slot について m(m-1)/2 件の転置を発行する。
+	// caller の hplPairEnumerationUpperBound() は同じ式で採寸しているので、
+	// 一致しないなら kernel と容量式のどちらかが片方だけ変更されている。
+	//
+	// これは重複 slot の転置発行が消えたことを検出する回帰 guard でもある。
+	// 転置を落とすと Hschur の対角 block が減算不足かつ非対称になるが、
+	// 溢れないので他に検出手段が無い (assert も CUDA error も出ない)。
+	if (hostNindices != mulBlockCapacity)
+	{
+		throw std::runtime_error(
+			"findHschureMulBlockIndices emission count mismatch: writes=" +
+			std::to_string(hostNindices) + ", expected=" + std::to_string(mulBlockCapacity) +
+			" (kernel の pair 列挙と hplPairEnumerationUpperBound() が不整合)");
 	}
 
 	auto ptrSrc = thrust::device_pointer_cast(mulBlockIds.data());
@@ -2869,6 +2913,7 @@ void twistCSR(int size, int nnz, const int* srcRowPtr, const int* srcColInd, con
 	const int grid = divUp(size, block);
 
 	permuteNnzPerRowKernel<<<grid, block>>>(size, srcRowPtr, P, nnzPerRow);
+	CUDA_CHECK(cudaMemset(nnzPerRow + size, 0, sizeof(int)));
 	exclusiveScan(nnzPerRow, dstRowPtr, size + 1);
 	CUDA_CHECK(cudaMemcpy(nnzPerRow, dstRowPtr, sizeof(int) * (size + 1), cudaMemcpyDeviceToDevice));
 	permuteColIndKernel<<<grid, block>>>(size, srcRowPtr, srcColInd, P, dstColInd, dstMap, nnzPerRow);
@@ -3213,6 +3258,9 @@ Scalar computeScale(const GpuVec1d& x, const GpuVec1d& b, Scalar* scale, Scalar 
 void solveDiagonalSystem(const GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuLx1BlockVec& xl)
 {
 	const int size = Hll.size();
+	if (size == 0)
+		return;
+
 	const int block = 1024;
 	const int grid = divUp(size, block);
 	solveDiagonalSystemKernel<<<grid, block>>>(size, Hll, bl, xl);
@@ -3222,6 +3270,9 @@ void solveDiagonalSystem(const GpuLxLBlockVec& Hll, GpuLx1BlockVec& bl, GpuLx1Bl
 void solveDiagonalSystem(const GpuPxPBlockVec& Hpp, GpuPx1BlockVec& bp, GpuPx1BlockVec& xp)
 {
 	const int size = Hpp.size();
+	if (size == 0)
+		return;
+
 	const int block = 512;
 	const int grid = divUp(size, block);
 	solveDiagonalSystemKernel<<<grid, block>>>(size, Hpp, bp, xp);
