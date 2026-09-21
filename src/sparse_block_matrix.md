@@ -21,6 +21,14 @@
 - `HschurSparseBlockMatrix` がこの module の主要な構成要素になっている
 - `resize` がこの module の主要な構成要素になっている
 - `HschurSparseBlockMatrix::constructFromVertices()` は、landmark ごとの active row 集合を `Hpl` と同じ unique な `iP` 集合として扱う。joint extrinsics では同じ extrinsics vertex が同じ landmark を複数 edge で参照するため、edge incidence をそのまま数えると `nmultiplies_` が過大になり、Schur metadata と `Hpl` の row-pair 列挙がずれる。
+- `HschurSparseBlockMatrix::constructFromVerticesAndRelativeEdges()` は、`nblocks_` を確定する前に
+  **全 pose row の対角 block を seed する**。非固定 landmark を共有する pose の組と relative pose edge の
+  端点からしか block を作らないため、固定 landmark としか繋がらない pose の row が空のまま残るからである。
+  空 row があると (a) `nnzSymm()` が対角 block 数を `brows_` で決め打ちしているぶん過小になり
+  `convertBSRToCSR()` の `colInd_` / `BSR2CSR_` が溢れ、(b) `initializeHschurKernel` が
+  `Hsc.at(HscRowPtr[rowId])` へ無条件に `Hpp` を書くため隣 row の先頭 block を上書きする。
+  詳細は `slam-core/reports/experiments/cuda-ba-hschur-empty-row-20260822.md`。
+  回帰 test は `tests/test_hschur_diag_blocks.cpp`。
 
 ### 連携境界
 - `Eigen/Core` と連携しながら責務を完結させる
